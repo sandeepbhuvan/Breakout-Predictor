@@ -1,0 +1,4 @@
+{
+  "apiKey": "paste the Web API key from Firebase console > Project settings > General",
+  "projectId": "your-firebase-project-id"
+}

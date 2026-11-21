@@ -26,6 +26,7 @@ Secrets (Upstox token, SMTP password) are never written to disk; they can be pre
 environment variables UPSTOX_ACCESS_TOKEN and HHLL_SMTP_PASSWORD.
 """
 
+import bisect
 import csv
 import gzip
 import io
@@ -77,7 +78,10 @@ DEFAULT_CONFIG = {
     "smtp_user": "",
     "email_to": "",
     "max_emails_per_day": 20,
+    "wma200_filter": False,
 }
+WEEKLY_CALENDAR_DAYS = 1950   # ~5.3 years: 200 completed weeks before every backtest day
+WMA_WEEKS = 200
 
 
 # =========================================================================== utils
@@ -116,7 +120,7 @@ def read_json(path, default=None):
 
 
 def write_json(path, data):
-    APP_DIR.mkdir(parents=True, exist_ok=True)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     tmp = Path(str(path) + ".tmp")
     tmp.write_text(json.dumps(data), encoding="utf-8")
     os.replace(tmp, path)
@@ -224,13 +228,17 @@ def proximity(R, price, max_dist):
     return 20 * (1 - dist / max_dist), dist
 
 
-def backtest(history, cfg, stop_event=None):
-    """Walk forward through stored history with the exact live rules."""
+def backtest(history, cfg, stop_event=None, weekly=None):
+    """Walk forward through stored history with the exact live rules.
+
+    With weekly data it also splits score >= threshold setups by the 200-week MA, so you can see whether the
+    filter actually helps before switching it on."""
     thr, max_dist, min_price = float(cfg["min_score"]), float(cfg["max_dist_pct"]), float(cfg["min_price"])
+    use_filter = bool(cfg.get("wma200_filter")) and weekly is not None
     buckets = {b: [0, 0] for b in ("<50", "50-60", "60-70", "70-80", "80+")}
-    near = [0, 0]
-    picked = [0, 0]
-    for stock in history.values():
+    near, picked = [0, 0], [0, 0]
+    split = {"above": [0, 0], "below": [0, 0], "no data": [0, 0]}
+    for key_, stock in history.items():
         if stop_event and stop_event.is_set():
             break
         n = len(stock["c"])
@@ -238,6 +246,7 @@ def backtest(history, cfg, stop_event=None):
             continue
         S = compute_series(stock)
         c = S["c"]
+        w = weekly.get(key_) if weekly else None
         for t in range(MIN_BARS - 1, n - HORIZON):
             if c[t] < min_price:
                 continue
@@ -247,16 +256,31 @@ def backtest(history, cfg, stop_event=None):
                 continue
             score = comp["base"] + prox[0]
             hit = any(c[j] > comp["R"] for j in range(t + 1, t + 1 + HORIZON))
-            key = "<50" if score < 50 else "80+" if score >= 80 else f"{int(score // 10) * 10}-{int(score // 10) * 10 + 10}"
-            for agg in (buckets[key], near) + ((picked,) if score >= thr else ()):
+            bucket = "<50" if score < 50 else "80+" if score >= 80 else f"{int(score // 10) * 10}-{int(score // 10) * 10 + 10}"
+            aggs = [buckets[bucket], near]
+            if score >= thr:
+                side = "no data"
+                if weekly is not None:
+                    wma = wma200_at(w, S["d"][t])
+                    side = "no data" if wma is None else "above" if c[t] > wma else "below"
+                    aggs.append(split[side])
+                if not use_filter or side == "above":
+                    aggs.append(picked)
+            for agg in aggs:
                 agg[0] += 1
                 agg[1] += hit
     rate = lambda a: f"{a[1] / a[0] * 100:.1f}% of {a[0]:,}" if a[0] else "n/a"  # noqa: E731
     lines = [f"Backtest: close above 20-day high within {HORIZON} sessions",
              f"  All stocks within {max_dist}% of R (baseline): {rate(near)}",
-             f"  Your setups (score >= {thr:g}):            {rate(picked)}",
+             f"  Your setups (score >= {thr:g}{', above 200W MA' if use_filter else ''}): {rate(picked)}",
              "  By score bucket:"]
     lines += [f"    {k:>6}: {rate(v)}" for k, v in buckets.items()]
+    if weekly is not None:
+        lines += [f"  Setups (score >= {thr:g}) split by the 200-week MA:",
+                  f"    above 200W MA: {rate(split['above'])}",
+                  f"    below 200W MA: {rate(split['below'])}",
+                  f"    under 200 weeks of data (newer listings): {rate(split['no data'])}",
+                  "  If 'above' clearly beats 'below', the 200-week filter is worth switching on."]
     lines.append("  (Overlapping days on the same stock are counted separately.)")
     lines.append("  Judge the threshold by the LIFT over the baseline, not the absolute %.")
     if near[0] and picked[0]:
@@ -330,9 +354,12 @@ class UpstoxClient:
                     out[q["instrument_token"]] = q
         return out
 
-    def daily_candles(self, key, to_date, from_date, limiter):
-        path = f"/historical-candle/{urllib.parse.quote(key, safe='')}/day/{to_date}/{from_date}"
+    def candles(self, key, interval, to_date, from_date, limiter):
+        path = f"/historical-candle/{urllib.parse.quote(key, safe='')}/{interval}/{to_date}/{from_date}"
         return (self.get(path, limiter=limiter).get("data") or {}).get("candles") or []
+
+    def daily_candles(self, key, to_date, from_date, limiter):
+        return self.candles(key, "day", to_date, from_date, limiter)
 
 
 # =========================================================================== data
@@ -384,18 +411,10 @@ def load_universe(cfg, log):
     return items
 
 
-def build_history(client, universe, log, progress, stop_event):
-    """~1 year of completed daily candles per stock (today excluded), oldest-first. Cached per day."""
-    path = APP_DIR / f"history_{today_str()}.json"
-    cached = read_json(path)
-    if cached:
-        return cached
-
-    log(f"Downloading daily history for {len(universe)} stocks (~{len(universe) // HISTORY_REQ_PER_SEC + 5}s)...")
-    to_date = today_str()
-    from_date = (now_ist() - timedelta(days=HISTORY_CALENDAR_DAYS)).strftime("%Y-%m-%d")
+def download_all(universe, fetch_one, log, progress, stop_event):
+    """Run fetch_one(item, limiter) for every stock, throttled. Returns ({key: result}, errors)."""
     limiter = RateLimiter(HISTORY_REQ_PER_SEC)
-    history, done, auth_failures, errors = {}, 0, 0, 0
+    out, done, auth_failures, errors = {}, 0, 0, 0
     lock = threading.Lock()
     blocked = threading.Event()
 
@@ -404,17 +423,10 @@ def build_history(client, universe, log, progress, stop_event):
         if stop_event.is_set() or blocked.is_set():
             return
         try:
-            candles = client.daily_candles(item["key"], to_date, from_date, limiter)
-            # Upstox returns newest-first: [timestamp, open, high, low, close, volume, oi]
-            bars = sorted((c for c in candles if not str(c[0]).startswith(to_date)), key=lambda c: str(c[0]))
-            if len(bars) >= MIN_BARS:
+            result = fetch_one(item, limiter)
+            if result is not None:
                 with lock:
-                    history[item["key"]] = {
-                        "symbol": item["symbol"], "industry": item["industry"],
-                        "d": [str(b[0])[:10] for b in bars],
-                        "h": [float(b[2]) for b in bars], "l": [float(b[3]) for b in bars],
-                        "c": [float(b[4]) for b in bars], "v": [float(b[5]) for b in bars],
-                    }
+                    out[item["key"]] = result
         except AuthError:
             with lock:
                 auth_failures += 1
@@ -438,26 +450,122 @@ def build_history(client, universe, log, progress, stop_event):
     if blocked.is_set():
         raise BlockedError("Upstox's firewall blocked the history download (Cloudflare 1010). "
                            "Try again later or from another network.")
-    if auth_failures and not history:
+    if auth_failures and not out:
         raise AuthError("Upstox rejected the token (401). It may have expired.")
-    if len(history) < 400:
-        raise RuntimeError(f"Only built history for {len(history)} stocks ({errors} errors); not saving.")
-    write_json(path, history)
-    for old in APP_DIR.glob("history_*.json"):
+    return out, errors
+
+
+def _save_replacing(path, data, pattern):
+    write_json(path, data)
+    for old in APP_DIR.glob(pattern):
         if old != path:
             old.unlink(missing_ok=True)
+
+
+def build_history(client, universe, log, progress, stop_event):
+    """~1 year of completed daily candles per stock (today excluded), oldest-first. Cached per day."""
+    path = APP_DIR / f"history_{today_str()}.json"
+    cached = read_json(path)
+    if cached:
+        return cached
+
+    log(f"Downloading daily history for {len(universe)} stocks (~{len(universe) // HISTORY_REQ_PER_SEC + 5}s)...")
+    to_date = today_str()
+    from_date = (now_ist() - timedelta(days=HISTORY_CALENDAR_DAYS)).strftime("%Y-%m-%d")
+
+    def fetch_one(item, limiter):
+        candles = client.daily_candles(item["key"], to_date, from_date, limiter)
+        # Upstox returns newest-first: [timestamp, open, high, low, close, volume, oi]
+        bars = sorted((c for c in candles if not str(c[0]).startswith(to_date)), key=lambda c: str(c[0]))
+        if len(bars) < MIN_BARS:
+            return None
+        return {"symbol": item["symbol"], "industry": item["industry"],
+                "d": [str(b[0])[:10] for b in bars],
+                "h": [float(b[2]) for b in bars], "l": [float(b[3]) for b in bars],
+                "c": [float(b[4]) for b in bars], "v": [float(b[5]) for b in bars]}
+
+    history, errors = download_all(universe, fetch_one, log, progress, stop_event)
+    if len(history) < 400:
+        raise RuntimeError(f"Only built history for {len(history)} stocks ({errors} errors); not saving.")
+    _save_replacing(path, history, "history_*.json")
     log(f"History saved for {len(history)} stocks.")
     return history
 
 
+def build_weekly(client, universe, log, progress, stop_event):
+    """~5 years of weekly closes per stock for the 200-week moving average. Cached per ISO week."""
+    year, week, _ = now_ist().isocalendar()
+    path = APP_DIR / f"weekly_{year}-W{week:02d}.json"
+    cached = read_json(path)
+    if cached:
+        return cached
+
+    log(f"Downloading weekly history for the 200-week MA ({len(universe)} stocks, ~"
+        f"{len(universe) // HISTORY_REQ_PER_SEC + 5}s, once a week)...")
+    to_date = today_str()
+    from_date = (now_ist() - timedelta(days=WEEKLY_CALENDAR_DAYS)).strftime("%Y-%m-%d")
+
+    def fetch_one(item, limiter):
+        bars = sorted(client.candles(item["key"], "week", to_date, from_date, limiter), key=lambda c: str(c[0]))
+        return {"d": [str(b[0])[:10] for b in bars], "c": [float(b[4]) for b in bars]} if bars else None
+
+    weekly, errors = download_all(universe, fetch_one, log, progress, stop_event)
+    if len(weekly) < 400:
+        raise RuntimeError(f"Only got weekly history for {len(weekly)} stocks ({errors} errors); not saving.")
+    _save_replacing(path, weekly, "weekly_*.json")
+    enough = sum(1 for w in weekly.values() if len(w["c"]) > WMA_WEEKS)
+    log(f"Weekly history saved. {enough} of {len(weekly)} stocks have 200+ weeks of data "
+        "(newer listings can't have a 200-week MA).")
+    return weekly
+
+
+def wma200_at(w, date_str):
+    """200-week simple MA of weekly closes from weeks that finished before date_str's week. None if too short."""
+    if not w:
+        return None
+    if "ps" not in w:
+        ps = [0.0]
+        for c in w["c"]:
+            ps.append(ps[-1] + c)
+        w["ps"] = ps
+    cutoff = (datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
+    idx = bisect.bisect_right(w["d"], cutoff)
+    if idx < WMA_WEEKS:
+        return None
+    return (w["ps"][idx] - w["ps"][idx - WMA_WEEKS]) / WMA_WEEKS
+
+
 # =========================================================================== prediction log
 
+def data_dir():
+    """Where the current user's predictions live: per account when signed in, else the shared local folder."""
+    return ACCOUNT.data_dir() if ACCOUNT else APP_DIR
+
+
 def load_predictions():
-    return read_json(APP_DIR / "predictions.json", []) or []
+    return read_json(data_dir() / "predictions.json", []) or []
 
 
 def save_predictions(preds):
-    write_json(APP_DIR / "predictions.json", preds)
+    write_json(data_dir() / "predictions.json", preds)
+    if ACCOUNT and ACCOUNT.signed_in:
+        ACCOUNT.queue_push(preds)
+
+
+def pred_id(p):
+    return f"{p['date']}_{p['symbol']}"
+
+
+def merge_predictions(*lists):
+    """Union by (date, symbol). A graded copy (hit/miss) wins over an open one."""
+    rank = {"open": 0, "hit": 1, "miss": 1}
+    out = {}
+    for lst in lists:
+        for p in lst or []:
+            k = pred_id(p)
+            if k not in out or rank.get(p.get("status"), 0) > rank.get(out[k].get("status"), 0):
+                out[k] = p
+    return sorted(out.values(), key=lambda p: (p["date"], p.get("time", "")))
 
 
 def grade_predictions(preds, history):
@@ -470,11 +578,11 @@ def grade_predictions(preds, history):
         if not s:
             continue
         window = [(d, c) for d, c in zip(s["d"], s["c"]) if d >= p["date"]][:HORIZON]
-        hit = next((d for d, c in window if c > p["R"]), None)
+        hit = next(((i, d, c) for i, (d, c) in enumerate(window) if c > p["R"]), None)
         if hit:
-            p["status"], p["resolved"] = "hit", hit
+            p["status"], p["resolved"], p["sessions"], p["resolved_close"] = "hit", hit[1], hit[0] + 1, hit[2]
         elif len(window) >= HORIZON:
-            p["status"], p["resolved"] = "miss", window[-1][0]
+            p["status"], p["resolved"], p["sessions"], p["resolved_close"] = "miss", window[-1][0], HORIZON, window[-1][1]
     return preds
 
 
@@ -504,6 +612,286 @@ def trade_date(q):
     except (TypeError, ValueError):
         s = str(raw)
         return s[:10] if len(s) >= 10 and s[4] == "-" else None
+
+
+# =========================================================================== Firebase account + sync
+
+FIREBASE_CONFIG_PATH = Path(__file__).with_name("firebase_config.json")
+ACCOUNT = None  # CloudAccount, created by the UI
+
+AUTH_MESSAGES = {
+    "EMAIL_EXISTS": "An account with this email already exists. Sign in instead.",
+    "INVALID_LOGIN_CREDENTIALS": "Wrong email or password.",
+    "INVALID_PASSWORD": "Wrong email or password.",
+    "EMAIL_NOT_FOUND": "Wrong email or password.",
+    "INVALID_EMAIL": "That email address doesn't look valid.",
+    "MISSING_PASSWORD": "Enter a password.",
+    "USER_DISABLED": "This account has been disabled.",
+    "TOO_MANY_ATTEMPTS_TRY_LATER": "Too many attempts. Wait a few minutes and try again.",
+    "OPERATION_NOT_ALLOWED": "Email/password sign-in isn't enabled in the Firebase project yet.",
+    "CONFIGURATION_NOT_FOUND": "Firebase Authentication isn't set up in the Firebase project yet.",
+    "TOKEN_EXPIRED": "Your session expired. Sign in again.",
+    "INVALID_REFRESH_TOKEN": "Your session expired. Sign in again.",
+}
+
+
+class CloudError(Exception):
+    def __init__(self, message, code=0):
+        super().__init__(message)
+        self.code = code
+
+
+def http_json(method, url, body=None, headers=None, timeout=30):
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    h = {"Content-Type": "application/json", "Accept": "application/json", "User-Agent": APP_USER_AGENT}
+    h.update(headers or {})
+    req = urllib.request.Request(url, data=data, headers=h, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            err = json.loads(raw).get("error", {})
+        except ValueError:
+            err = {}
+        msg = err.get("message") if isinstance(err, dict) else str(err)
+        raise CloudError(msg or f"HTTP {e.code}", e.code) from None
+    except urllib.error.URLError as e:
+        raise CloudError(f"Can't reach Firebase: {e.reason}") from None
+
+
+def fs_encode(v):
+    """Python value -> Firestore REST typed value."""
+    if v is None:
+        return {"nullValue": None}
+    if isinstance(v, bool):
+        return {"booleanValue": v}
+    if isinstance(v, int):
+        return {"integerValue": str(v)}
+    if isinstance(v, float):
+        return {"doubleValue": v}
+    if isinstance(v, str):
+        return {"stringValue": v}
+    if isinstance(v, (list, tuple)):
+        return {"arrayValue": {"values": [fs_encode(x) for x in v]}}
+    if isinstance(v, dict):
+        return {"mapValue": {"fields": {str(k): fs_encode(x) for k, x in v.items()}}}
+    raise TypeError(f"Can't store {type(v).__name__} in Firestore")
+
+
+def fs_decode(v):
+    """Firestore REST typed value -> Python value."""
+    (kind, val), = v.items()
+    if kind == "integerValue":
+        return int(val)
+    if kind == "doubleValue":
+        return float(val)
+    if kind == "arrayValue":
+        return [fs_decode(x) for x in val.get("values", [])]
+    if kind == "mapValue":
+        return {k: fs_decode(x) for k, x in val.get("fields", {}).items()}
+    if kind == "nullValue":
+        return None
+    return val  # stringValue, booleanValue, timestampValue
+
+
+def load_firebase_config():
+    cfg = read_json(FIREBASE_CONFIG_PATH, {}) or {}
+    return cfg if cfg.get("apiKey") and cfg.get("projectId") else None
+
+
+class CloudAccount:
+    """Firebase Auth (email/password) + Firestore storage at users/{uid} and users/{uid}/predictions/{date_symbol}.
+
+    The session (refresh token) is kept in ~/.breakout_predictor/session.json so you stay signed in, the same way a
+    browser keeps a login cookie. Upstox tokens and SMTP passwords are never sent to Firebase."""
+
+    def __init__(self, notify=None):
+        self.fb = load_firebase_config()
+        self.notify = notify or (lambda *a: None)   # notify(kind, payload)
+        self.uid = self.email = self.id_token = self.refresh_token = None
+        self.expires_at = 0.0
+        self.lock = threading.RLock()
+        self.synced = {}                              # pred_id -> json of what the cloud has
+        self.push_q = queue.Queue()
+        threading.Thread(target=self._pusher, daemon=True).start()
+
+    # ---- state
+    @property
+    def configured(self):
+        return self.fb is not None
+
+    @property
+    def signed_in(self):
+        return self.uid is not None
+
+    def data_dir(self):
+        return APP_DIR / "users" / self.uid if self.uid else APP_DIR
+
+    # ---- auth
+    def _auth(self, endpoint, body):
+        url = f"https://identitytoolkit.googleapis.com/v1/accounts:{endpoint}?key={self.fb['apiKey']}"
+        try:
+            return http_json("POST", url, body)
+        except CloudError as e:
+            key = str(e).split(" ")[0].split(":")[0]
+            if key == "WEAK_PASSWORD":
+                raise CloudError("Password must be at least 6 characters.", e.code) from None
+            raise CloudError(AUTH_MESSAGES.get(key, str(e)), e.code) from None
+
+    def _set_session(self, uid, email, id_token, refresh_token, expires_in):
+        with self.lock:
+            if uid != self.uid:
+                self.synced = {}
+            self.uid, self.email, self.id_token, self.refresh_token = uid, email, id_token, refresh_token
+            self.expires_at = time.time() + int(expires_in or 3600) - 120
+        write_json(APP_DIR / "session.json", {"uid": uid, "email": email, "refresh_token": refresh_token})
+
+    def sign_up(self, email, password):
+        r = self._auth("signUp", {"email": email, "password": password, "returnSecureToken": True})
+        self._set_session(r["localId"], r["email"], r["idToken"], r["refreshToken"], r.get("expiresIn"))
+        try:
+            self._auth("sendOobCode", {"requestType": "VERIFY_EMAIL", "idToken": r["idToken"]})
+        except CloudError:
+            pass  # verification email is a courtesy, not required
+
+    def sign_in(self, email, password):
+        r = self._auth("signInWithPassword", {"email": email, "password": password, "returnSecureToken": True})
+        self._set_session(r["localId"], r["email"], r["idToken"], r["refreshToken"], r.get("expiresIn"))
+
+    def reset_password(self, email):
+        self._auth("sendOobCode", {"requestType": "PASSWORD_RESET", "email": email})
+
+    def restore(self):
+        """Resume the saved session. Returns True if signed in."""
+        s = read_json(APP_DIR / "session.json")
+        if not (self.configured and s and s.get("refresh_token")):
+            return False
+        self.refresh_token, self.email = s["refresh_token"], s.get("email")
+        try:
+            self._refresh()
+        except CloudError as e:
+            if e.code in (400, 401, 403):
+                self.sign_out()
+            raise
+        return True
+
+    def _refresh(self):
+        url = f"https://securetoken.googleapis.com/v1/token?key={self.fb['apiKey']}"
+        try:
+            r = http_json("POST", url, {"grant_type": "refresh_token", "refresh_token": self.refresh_token})
+        except CloudError as e:
+            raise CloudError(AUTH_MESSAGES.get(str(e).split(" ")[0], str(e)), e.code) from None
+        self._set_session(r["user_id"], self.email, r["id_token"], r["refresh_token"], r.get("expires_in"))
+
+    def sign_out(self):
+        with self.lock:
+            self.uid = self.email = self.id_token = self.refresh_token = None
+            self.synced = {}
+        try:
+            (APP_DIR / "session.json").unlink()
+        except OSError:
+            pass
+
+    def _token(self):
+        with self.lock:
+            if time.time() >= self.expires_at:
+                self._refresh()
+            return self.id_token
+
+    # ---- Firestore
+    def _root(self):
+        return f"projects/{self.fb['projectId']}/databases/(default)/documents"
+
+    def _fs(self, method, path, body=None):
+        url = f"https://firestore.googleapis.com/v1/{path}"
+        for attempt in (1, 2):
+            try:
+                return http_json(method, url, body, {"Authorization": f"Bearer {self._token()}"})
+            except CloudError as e:
+                if e.code == 401 and attempt == 1:
+                    with self.lock:
+                        self.expires_at = 0
+                    continue
+                if e.code == 403:
+                    raise CloudError("Firestore refused access. Check the security rules in the Firebase console "
+                                     "(see firestore.rules).", 403) from None
+                if e.code == 404 and "database (default) does not exist" in str(e).lower():
+                    raise CloudError("No Firestore database in this Firebase project yet. Create one in the "
+                                     "Firebase console.", 404) from None
+                raise
+
+    def pull_predictions(self):
+        out, token = [], ""
+        while True:
+            path = f"{self._root()}/users/{self.uid}/predictions?pageSize=300"
+            r = self._fs("GET", path + (f"&pageToken={urllib.parse.quote(token)}" if token else ""))
+            for doc in r.get("documents", []):
+                out.append({k: fs_decode(v) for k, v in doc.get("fields", {}).items()})
+            token = r.get("nextPageToken")
+            if not token:
+                return out
+
+    def _commit(self, preds):
+        writes = [{"update": {"name": f"{self._root()}/users/{self.uid}/predictions/{pred_id(p)}",
+                              "fields": {k: fs_encode(v) for k, v in p.items()}}} for p in preds]
+        for i in range(0, len(writes), 400):
+            self._fs("POST", f"{self._root()}:commit", {"writes": writes[i:i + 400]})
+
+    def pull_settings(self):
+        try:
+            doc = self._fs("GET", f"{self._root()}/users/{self.uid}")
+        except CloudError as e:
+            if e.code == 404:
+                return None
+            raise
+        s = doc.get("fields", {}).get("settings")
+        return fs_decode(s) if s else None
+
+    def push_settings(self, cfg):
+        settings = {k: cfg[k] for k in DEFAULT_CONFIG if k in cfg}
+        self._fs("PATCH", f"{self._root()}/users/{self.uid}?updateMask.fieldPaths=settings&updateMask.fieldPaths=email",
+                 {"fields": {"settings": fs_encode(settings), "email": fs_encode(self.email or "")}})
+
+    def sync(self, extra=None):
+        """Two-way merge of predictions. Returns the merged list (also saved locally)."""
+        remote = self.pull_predictions()
+        local = read_json(self.data_dir() / "predictions.json", []) or []
+        merged = merge_predictions(local, extra or [], remote)
+        write_json(self.data_dir() / "predictions.json", merged)
+        remote_by_id = {pred_id(p): json.dumps(p, sort_keys=True) for p in remote}
+        with self.lock:
+            self.synced = dict(remote_by_id)
+        changed = [p for p in merged if remote_by_id.get(pred_id(p)) != json.dumps(p, sort_keys=True)]
+        if changed:
+            self._commit(changed)
+            with self.lock:
+                for p in changed:
+                    self.synced[pred_id(p)] = json.dumps(p, sort_keys=True)
+        self.notify("synced", len(merged))
+        return merged
+
+    def queue_push(self, preds):
+        with self.lock:
+            changed = [p for p in preds if self.synced.get(pred_id(p)) != json.dumps(p, sort_keys=True)]
+        if changed:
+            self.push_q.put(changed)
+
+    def _pusher(self):
+        while True:
+            batch = self.push_q.get()
+            if not self.signed_in:
+                continue
+            try:
+                self._commit(batch)
+                with self.lock:
+                    for p in batch:
+                        self.synced[pred_id(p)] = json.dumps(p, sort_keys=True)
+                self.notify("synced", None)
+            except Exception as e:  # noqa: BLE001 - stays dirty; retried on the next save or sync
+                self.notify("sync_error", str(e))
 
 
 # =========================================================================== email
@@ -556,6 +944,8 @@ class Engine(threading.Thread):
         self.prepared_for = None
         self.history = self.setups = None
         self.logged_sample = False
+        self.universe = None
+        self.weekly = None
         self.preview_for = None
 
     def log(self, msg):
@@ -577,8 +967,17 @@ class Engine(threading.Thread):
                 self.scan_once(live=False)
             elif self.mode == "backtest":
                 self.prepare()
+                weekly = self.weekly
+                if weekly is None:
+                    try:
+                        weekly = build_weekly(self.client, self.universe, self.log,
+                                              lambda d, t: self.events.put(("progress", d, t)), self.stop_event)
+                    except (AuthError, InterruptedError):
+                        raise
+                    except Exception as e:  # noqa: BLE001 - backtest still runs without the 200W split
+                        self.log(f"Weekly history unavailable, skipping the 200-week MA split: {e}")
                 self.status("Running backtest...")
-                report = backtest(self.history, self.cfg, self.stop_event)
+                report = backtest(self.history, self.cfg, self.stop_event, weekly)
                 self.log(report)
                 self.events.put(("backtest", report))
                 self.events.put(("stats", prediction_stats(load_predictions())))
@@ -600,9 +999,12 @@ class Engine(threading.Thread):
         """Load history, grade old predictions, precompute today's setup components."""
         if self.prepared_for == today_str():
             return
-        universe = load_universe(self.cfg, self.log)
-        self.history = build_history(self.client, universe, self.log,
-                                     lambda d, t: self.events.put(("progress", d, t)), self.stop_event)
+        universe = self.universe = load_universe(self.cfg, self.log)
+        progress = lambda d, t: self.events.put(("progress", d, t))  # noqa: E731
+        self.history = build_history(self.client, universe, self.log, progress, self.stop_event)
+        self.weekly = None
+        if self.cfg.get("wma200_filter"):
+            self.weekly = build_weekly(self.client, universe, self.log, progress, self.stop_event)
         preds = grade_predictions(load_predictions(), self.history)
         save_predictions(preds)
         self.events.put(("stats", prediction_stats(preds)))
@@ -613,6 +1015,8 @@ class Engine(threading.Thread):
             t = len(S["c"]) - 1
             comp = setup_components(S, t)
             comp.update(symbol=stock["symbol"], industry=stock["industry"], prev_close=S["c"][t])
+            if self.weekly is not None:
+                comp["wma200"] = wma200_at(self.weekly.get(key), today_str())
             self.setups[key] = comp
         self.prepared_for = today_str()
         self.log(f"Setups computed for {len(self.setups)} stocks from completed sessions.")
@@ -672,10 +1076,15 @@ class Engine(threading.Thread):
             prox = proximity(s["R"], ltp, max_dist)
             if not prox:
                 continue
+            reasons = s["reasons"]
+            if self.weekly is not None:
+                if not s.get("wma200") or ltp <= s["wma200"]:
+                    continue  # 200-week MA filter: skip stocks below it or without 200 weeks of data
+                reasons = reasons + ["above 200W MA"]
             score = s["base"] + prox[0]
             if score >= thr:
                 rows.append({"key": key, "symbol": s["symbol"], "industry": s["industry"], "ltp": ltp,
-                             "R": s["R"], "dist": prox[1], "score": score, "reasons": s["reasons"]})
+                             "R": s["R"], "dist": prox[1], "score": score, "reasons": reasons})
         rows.sort(key=lambda r: r["score"], reverse=True)
 
         if live and stale > len(self.setups) / 2:
@@ -832,11 +1241,22 @@ class App(tk.Tk):
         self.vars = {}
         self.row_count = None
         self.smtp_pw_var = tk.StringVar(value=os.environ.get("HHLL_SMTP_PASSWORD", ""))
+        global ACCOUNT
+        ACCOUNT = CloudAccount(notify=lambda kind, payload: self.events.put(("cloud", kind, payload)))
         self._style()
         self._build()
         self._refresh_stats()
         self._set_pill("idle")
+        self._update_account_ui()
         self.after(200, self._drain_events)
+        if ACCOUNT.configured and (APP_DIR / "session.json").exists():
+            self.sync_label.configure(text="Signing in…")
+            def resume():
+                if ACCOUNT.restore():
+                    ACCOUNT.sync()
+                else:
+                    raise CloudError("Saved sign-in not found. Sign in again.")
+            self._cloud_task(resume, "restored")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ------------------------------------------------------------------ styling
@@ -875,6 +1295,18 @@ class App(tk.Tk):
                   bordercolor=[("disabled", P["surface2"]), ("active", hover)],
                   lightcolor=[("disabled", P["surface2"]), ("active", hover)],
                   darkcolor=[("disabled", P["surface2"]), ("active", hover)])
+
+        for name, bg, fg, hover in [("Seg", P["surface"], P["muted"], P["surface2"]),
+                                    ("SegOn", P["surface2"], P["text"], P["surface2"])]:
+            s.configure(f"{name}.TButton", background=bg, foreground=fg, bordercolor=P["border"] if name == "SegOn" else bg,
+                        lightcolor=bg, darkcolor=bg, padding=(12, 5), font=(FONT, 9, "bold"), focuscolor=bg)
+            s.map(f"{name}.TButton", background=[("active", hover)], lightcolor=[("active", hover)],
+                  darkcolor=[("active", hover)], foreground=[("active", P["text"])])
+        s.configure("Card.TCheckbutton", background=P["surface"], foreground=P["text"], focuscolor=P["surface"],
+                    indicatorbackground=P["surface2"], indicatorforeground=P["accent"], indicatormargin=(0, 0, 8, 0))
+        s.map("Card.TCheckbutton", background=[("active", P["surface"])],
+              indicatorbackground=[("selected", P["accent"]), ("active", P["surface2"])],
+              indicatorforeground=[("selected", "#ffffff")])
 
         s.configure("Treeview", background=P["surface"], fieldbackground=P["surface"], foreground=P["text"],
                     rowheight=36, borderwidth=0, font=(FONT, 10))
@@ -926,10 +1358,12 @@ class App(tk.Tk):
 
         self.pill = tk.Frame(header, bg=P["surface2"], padx=14, pady=7)
         self.pill.pack(side="right")
-        ttk.Button(header, text="✉  Email alerts", style="Ghost.TButton",
-                   command=self.open_email_dialog).pack(side="right", padx=(0, 12))
-        self.email_hint = ttk.Label(header, style="Status.TLabel")
-        self.email_hint.pack(side="right", padx=(0, 12))
+        self.email_hint = ttk.Button(header, style="Ghost.TButton", command=self.open_email_dialog)
+        self.email_hint.pack(side="right", padx=(0, 10))
+        self.account_btn = ttk.Button(header, style="Ghost.TButton", command=self.open_account_dialog)
+        self.account_btn.pack(side="right", padx=(0, 10))
+        self.sync_label = ttk.Label(header, style="Status.TLabel")
+        self.sync_label.pack(side="right", padx=(0, 12))
         self.pill_dot = tk.Canvas(self.pill, width=10, height=10, bg=P["surface2"], highlightthickness=0)
         self.pill_dot.pack(side="left", padx=(0, 8))
         self.pill_text = tk.Label(self.pill, bg=P["surface2"], fg=P["text"], font=(FONT, 9, "bold"))
@@ -962,8 +1396,9 @@ class App(tk.Tk):
             self.vars[k] = tk.StringVar(value=str(self.cfg[k]))
             ttk.Entry(grid, textvariable=self.vars[k], width=8, justify="right").grid(row=i, column=1, sticky="e", pady=5)
         grid.columnconfigure(0, weight=1)
-        ttk.Label(c, text=f"A hit = a daily close above the 20-day high\nwithin {HORIZON} sessions of the prediction.",
-                  style="Hint.TLabel", justify="left").pack(anchor="w", pady=(10, 0))
+        self.wma_var = tk.BooleanVar(value=bool(self.cfg.get("wma200_filter")))
+        ttk.Checkbutton(c, text="Only stocks above 200-week MA", variable=self.wma_var,
+                        style="Card.TCheckbutton").pack(anchor="w", pady=(10, 0))
 
         outer, c = self._card(side, "Actions")
         outer.pack(fill="x")
@@ -1000,10 +1435,23 @@ class App(tk.Tk):
         self.status_var = tk.StringVar(value="Paste your Upstox token, then Scan now or Start live predictor.")
         ttk.Label(main, textvariable=self.status_var, style="Status.TLabel").grid(row=1, column=0, sticky="w", pady=(12, 8))
 
-        outer, c = self._card(main, "Predictions", "highlighted rows are new  ·  sorted by score", padding=(18, 14))
+        outer, c = self._card(main, padding=(18, 14))
         outer.grid(row=2, column=0, sticky="nsew")
-        tbl = ttk.Frame(c, style="Card.TFrame")
-        tbl.pack(fill="both", expand=True)
+        head = ttk.Frame(c, style="Card.TFrame")
+        head.pack(fill="x", pady=(0, 10))
+        self.tab_btns = {}
+        for name, text in [("live", "Live setups"), ("track", "Track record")]:
+            self.tab_btns[name] = ttk.Button(head, text=text, style="Seg.TButton", width=-4,
+                                             command=lambda n=name: self._show_tab(n))
+            self.tab_btns[name].pack(side="left", padx=(0, 6))
+        self.tab_hint = ttk.Label(head, style="Hint.TLabel")
+        self.tab_hint.pack(side="right")
+
+        holder = ttk.Frame(c, style="Card.TFrame")
+        holder.pack(fill="both", expand=True)
+        self.tabs = {"live": ttk.Frame(holder, style="Card.TFrame"), "track": ttk.Frame(holder, style="Card.TFrame")}
+        self._build_track(self.tabs["track"])
+        tbl = self.tabs["live"]
         self.tree = ttk.Treeview(tbl, columns=[col[0] for col in self.COLUMNS], show="headings", selectmode="browse")
         for key, title, width, anchor in self.COLUMNS:
             self.tree.heading(key, text=title, anchor=anchor)
@@ -1017,6 +1465,7 @@ class App(tk.Tk):
         self.empty_label = tk.Label(tbl, text="No predictions yet.\nRun a scan to see stocks coiling under resistance.",
                                     bg=P["surface"], fg=P["muted"], font=(FONT, 10), justify="center")
         self.empty_label.place(relx=0.5, rely=0.5, anchor="center")
+        self._show_tab("live")
 
         outer, c = self._card(main, padding=(18, 12))
         outer.grid(row=3, column=0, sticky="ew", pady=(14, 0))
@@ -1043,6 +1492,80 @@ class App(tk.Tk):
         # Read-only but still selectable / Ctrl+C-able.
         self.log_box.bind("<Control-a>", lambda e: (self.log_box.tag_add("sel", "1.0", "end"), "break")[1])
 
+    TRACK_COLUMNS = [("date", "PREDICTED", 145, "w"), ("symbol", "STOCK", 110, "w"), ("score", "SCORE", 65, "e"),
+                     ("entry", "PRICE THEN", 100, "e"), ("R", "BREAKOUT LEVEL", 125, "e"), ("status", "RESULT", 95, "w"),
+                     ("resolved", "RESOLVED ON", 105, "e"), ("sessions", "SESSIONS", 80, "e"), ("move", "MOVE", 85, "e")]
+
+    def _build_track(self, parent):
+        bar = ttk.Frame(parent, style="Card.TFrame")
+        bar.pack(fill="x", pady=(0, 8))
+        self.track_filter = "all"
+        self.filter_btns = {}
+        for name, text in [("all", "All"), ("hit", "Hits"), ("miss", "Misses"), ("open", "Open")]:
+            self.filter_btns[name] = ttk.Button(bar, text=text, style="Seg.TButton", width=-4,
+                                                command=lambda n=name: self._set_track_filter(n))
+            self.filter_btns[name].pack(side="left", padx=(0, 6))
+        self.track_summary = ttk.Label(bar, style="Hint.TLabel")
+        self.track_summary.pack(side="right")
+
+        box = ttk.Frame(parent, style="Card.TFrame")
+        box.pack(fill="both", expand=True)
+        self.track = ttk.Treeview(box, columns=[col[0] for col in self.TRACK_COLUMNS], show="headings", selectmode="browse")
+        for key, title, width, anchor in self.TRACK_COLUMNS:
+            self.track.heading(key, text=title, anchor=anchor)
+            self.track.column(key, width=int(width * self.k), anchor=anchor, stretch=key == "symbol")
+        self.track.tag_configure("hit", foreground=P["green"])
+        self.track.tag_configure("miss", foreground=P["red"])
+        self.track.tag_configure("open", foreground=P["muted"])
+        sb = ttk.Scrollbar(box, orient="vertical", command=self.track.yview)
+        self.track.configure(yscrollcommand=sb.set)
+        self.track.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.track_empty = tk.Label(box, bg=P["surface"], fg=P["muted"], font=(FONT, 10), justify="center",
+                                    text="No live predictions recorded yet.\nThey are logged while the live "
+                                         "predictor runs during market hours,\nthen graded after up to 7 sessions.")
+        self._set_track_filter("all")
+
+    def _show_tab(self, name):
+        for n, frame in self.tabs.items():
+            frame.pack_forget()
+            self.tab_btns[n].configure(style="SegOn.TButton" if n == name else "Seg.TButton")
+        self.tabs[name].pack(fill="both", expand=True)
+        self.tab_hint.configure(text="highlighted rows are new  ·  sorted by score" if name == "live" else
+                                f"hit = a close above the breakout level within {HORIZON} sessions  ·  newest first")
+        if name == "track":
+            self._refresh_track()
+
+    def _set_track_filter(self, name):
+        self.track_filter = name
+        for n, b in self.filter_btns.items():
+            b.configure(style="SegOn.TButton" if n == name else "Seg.TButton")
+        self._refresh_track()
+
+    def _refresh_track(self):
+        preds = load_predictions()
+        hit = sum(p["status"] == "hit" for p in preds)
+        miss = sum(p["status"] == "miss" for p in preds)
+        opened = sum(p["status"] == "open" for p in preds)
+        self.track_summary.configure(text=f"{hit} hits  ·  {miss} misses  ·  {opened} open")
+        self.track.delete(*self.track.get_children())
+        shown = [p for p in preds if self.track_filter == "all" or p["status"] == self.track_filter]
+        shown.sort(key=lambda p: (p["date"], p.get("time", "")), reverse=True)
+        label = {"hit": "✓ Hit", "miss": "✗ Missed", "open": "• Open"}
+        for p in shown:
+            move = "—"
+            if p.get("resolved_close") and p.get("price"):
+                move = f"{(p['resolved_close'] - p['price']) / p['price'] * 100:+.2f}%"
+            self.track.insert("", "end", tags=(p["status"],), values=(
+                f"{p['date']} {p.get('time', '')}".strip(), p["symbol"], f"{p.get('score', 0):.0f}",
+                f"₹{p['price']:,.2f}" if p.get("price") else "—", f"₹{p['R']:,.2f}",
+                label.get(p["status"], p["status"]), p.get("resolved", "—"),
+                str(p["sessions"]) if p.get("sessions") else "—", move))
+        if shown:
+            self.track_empty.place_forget()
+        else:
+            self.track_empty.place(relx=0.5, rely=0.5, anchor="center")
+
     # ------------------------------------------------------------------ helpers
     def _set_pill(self, state):
         color, text = {"idle": (P["muted"], "IDLE"), "live": (P["green"], "LIVE"),
@@ -1064,9 +1587,8 @@ class App(tk.Tk):
     def _update_email_hint(self):
         to = self.cfg.get("email_to")
         ready = to and self.cfg.get("smtp_user") and self.smtp_pw_var.get()
-        self.email_hint.configure(text=f"Emailing {to}" if ready else
-                                  "Email off · alerts show here only" if not to else
-                                  "Email needs the SMTP password")
+        self.email_hint.configure(text="✉  Email: on" if ready else
+                                  "✉  Email: off" if not to else "✉  Email: needs password")
 
     def _refresh_stats(self):
         preds = load_predictions()
@@ -1081,6 +1603,8 @@ class App(tk.Tk):
         self.stat["hit"][0].configure(text=f"{hit / (hit + miss) * 100:.0f}%" if hit + miss else "—",
                                       foreground=P["text"])
         self.stat["hit"][1].configure(text=f"{hit} hit  ·  {miss} missed" if hit + miss else "graded after 7 sessions")
+        if hasattr(self, "track"):
+            self._refresh_track()
         bt = read_json(APP_DIR / "backtest.json")
         if bt:
             lift = bt["setups"] - bt["baseline"]
@@ -1129,6 +1653,7 @@ class App(tk.Tk):
             cfg["min_price"] = float(cfg["min_price"] or 0)
             cfg["smtp_port"] = int(cfg["smtp_port"] or 465)
             cfg["max_emails_per_day"] = int(cfg["max_emails_per_day"] or 20)
+            cfg["wma200_filter"] = bool(self.wma_var.get())
         except ValueError:
             messagebox.showerror("Settings", "Score, distance, price, port and max emails must be numbers.")
             return None
@@ -1137,7 +1662,211 @@ class App(tk.Tk):
             return None
         self.cfg = cfg
         save_config(cfg)
+        if ACCOUNT and ACCOUNT.signed_in:
+            self._cloud_task(lambda: ACCOUNT.push_settings(cfg), None)
         return cfg
+
+    # ------------------------------------------------------------------ account
+    def _cloud_task(self, fn, done_kind):
+        """Run a Firebase call off the UI thread; report back through the event queue."""
+        def work():
+            try:
+                fn()
+                if done_kind:
+                    self.events.put(("cloud", done_kind, None))
+            except Exception as e:  # noqa: BLE001 - shown in the UI
+                self.events.put(("cloud", "sync_error", str(e)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _update_account_ui(self, sync_text=None):
+        if not ACCOUNT.configured:
+            self.account_btn.configure(text="○  Account")
+            self.sync_label.configure(text="Local only")
+        elif ACCOUNT.signed_in:
+            self.account_btn.configure(text=f"●  {ACCOUNT.email}")
+            if sync_text is not None:
+                self.sync_label.configure(text=sync_text)
+        else:
+            self.account_btn.configure(text="○  Sign in")
+            self.sync_label.configure(text="Local only · sign in to sync")
+
+    def _engine_busy(self):
+        if self.engine and self.engine.is_alive():
+            messagebox.showinfo("Account", "Stop the predictor before signing in or out.")
+            return True
+        return False
+
+    def open_account_dialog(self):
+        if not ACCOUNT.configured:
+            messagebox.showinfo(
+                "Account", "Accounts and cloud sync need a Firebase project.\n\n"
+                f"Create {FIREBASE_CONFIG_PATH.name} next to the app (see firebase_config.example.json and the "
+                "README), then restart the app.\n\nUntil then everything is stored on this PC only.")
+            return
+        if ACCOUNT.signed_in:
+            return self._open_signed_in_dialog()
+        if self._engine_busy():
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Sign in")
+        win.configure(bg=P["bg"])
+        win.transient(self)
+        win.resizable(False, False)
+        outer, c = self._card(win)
+        outer.pack(fill="both", expand=True, padx=20, pady=20)
+        mode = {"value": "signin"}
+
+        seg = ttk.Frame(c, style="Card.TFrame")
+        seg.pack(fill="x", pady=(0, 14))
+        seg_btns = {}
+        email_var, pw_var, pw2_var = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        ttk.Label(c, text="Email", style="Field.TLabel").pack(anchor="w", pady=(0, 4))
+        email_entry = ttk.Entry(c, textvariable=email_var, width=36)
+        email_entry.pack(fill="x", pady=(0, 12))
+        ttk.Label(c, text="Password", style="Field.TLabel").pack(anchor="w", pady=(0, 4))
+        ttk.Entry(c, textvariable=pw_var, show="•", width=36).pack(fill="x", pady=(0, 12))
+        confirm = ttk.Frame(c, style="Card.TFrame")
+        ttk.Label(confirm, text="Confirm password", style="Field.TLabel").pack(anchor="w", pady=(0, 4))
+        ttk.Entry(confirm, textvariable=pw2_var, show="•", width=36).pack(fill="x", pady=(0, 12))
+        error = tk.Label(c, bg=P["surface"], fg=P["red"], font=(FONT, 9), wraplength=int(300 * self.k), justify="left")
+        error.pack(anchor="w")
+        row = ttk.Frame(c, style="Card.TFrame")
+        row.pack(fill="x", pady=(8, 0))
+        forgot = ttk.Button(row, text="Forgot password?", style="Seg.TButton")
+        forgot.pack(side="left")
+        submit = ttk.Button(row, style="Accent.TButton")
+        submit.pack(side="right")
+        note = ttk.Label(c, style="Hint.TLabel", wraplength=int(300 * self.k), justify="left",
+                         text="Your predictions and settings sync to your account. Upstox tokens and email "
+                              "passwords stay on this PC.")
+        note.pack(anchor="w", pady=(14, 0))
+
+        def set_mode(m):
+            mode["value"] = m
+            for n, b in seg_btns.items():
+                b.configure(style="SegOn.TButton" if n == m else "Seg.TButton")
+            submit.configure(text="Sign in" if m == "signin" else "Create account")
+            if m == "signup":
+                confirm.pack(fill="x", before=error)
+            else:
+                confirm.pack_forget()
+            error.configure(text="")
+
+        for name, text in [("signin", "Sign in"), ("signup", "Create account")]:
+            seg_btns[name] = ttk.Button(seg, text=text, style="Seg.TButton", width=-4, command=lambda n=name: set_mode(n))
+            seg_btns[name].pack(side="left", padx=(0, 6))
+
+        def finish(err):
+            submit.configure(state="normal")
+            if err:
+                error.configure(text=err, fg=P["red"])
+                return
+            win.destroy()
+            self._after_sign_in()
+
+        def go():
+            email, pw = email_var.get().strip(), pw_var.get()
+            if not email or not pw:
+                error.configure(text="Enter your email and password.", fg=P["red"])
+                return
+            if mode["value"] == "signup" and pw != pw2_var.get():
+                error.configure(text="The passwords don't match.", fg=P["red"])
+                return
+            submit.configure(state="disabled")
+            error.configure(text="Working…", fg=P["muted"])
+            fn = ACCOUNT.sign_up if mode["value"] == "signup" else ACCOUNT.sign_in
+
+            def work():
+                try:
+                    fn(email, pw)
+                    self.after(0, finish, None)
+                except Exception as e:  # noqa: BLE001
+                    self.after(0, finish, str(e))
+            threading.Thread(target=work, daemon=True).start()
+
+        def forgot_pw():
+            email = email_var.get().strip()
+            if not email:
+                error.configure(text="Enter your email first, then click Forgot password.", fg=P["red"])
+                return
+
+            def work():
+                try:
+                    ACCOUNT.reset_password(email)
+                    self.after(0, lambda: error.configure(text=f"Password reset email sent to {email}.", fg=P["green"]))
+                except Exception as e:  # noqa: BLE001
+                    self.after(0, lambda: error.configure(text=str(e), fg=P["red"]))
+            threading.Thread(target=work, daemon=True).start()
+
+        submit.configure(command=go)
+        forgot.configure(command=forgot_pw)
+        win.bind("<Return>", lambda e: go())
+        set_mode("signin")
+        email_entry.focus_set()
+        win.grab_set()
+
+    def _after_sign_in(self):
+        """Pull account data, optionally adopting predictions recorded on this PC before signing in."""
+        self._update_account_ui("Syncing…")
+        extra = None
+        local_root = read_json(APP_DIR / "predictions.json", []) or []
+        marker = ACCOUNT.data_dir() / "imported_local.flag"
+        if local_root and not marker.exists():
+            if messagebox.askyesno("Account", f"Add the {len(local_root)} prediction(s) recorded on this PC before "
+                                              f"you signed in to {ACCOUNT.email}?"):
+                extra = local_root
+            write_json(marker, {"answered": True})
+
+        def work():
+            ACCOUNT.sync(extra)
+            remote_cfg = ACCOUNT.pull_settings()
+            if remote_cfg:
+                self.events.put(("cloud", "settings", remote_cfg))
+            else:
+                ACCOUNT.push_settings(self.cfg)
+        self._cloud_task(work, None)
+
+    def _open_signed_in_dialog(self):
+        win = tk.Toplevel(self)
+        win.title("Account")
+        win.configure(bg=P["bg"])
+        win.transient(self)
+        win.resizable(False, False)
+        outer, c = self._card(win, "Account")
+        outer.pack(fill="both", expand=True, padx=20, pady=20)
+        ttk.Label(c, text="Signed in as", style="Field.TLabel").pack(anchor="w")
+        ttk.Label(c, text=ACCOUNT.email, style="CardTitle.TLabel").pack(anchor="w", pady=(2, 10))
+        ttk.Label(c, text=f"Status: {self.sync_label.cget('text')}", style="Hint.TLabel").pack(anchor="w", pady=(0, 14))
+        row = ttk.Frame(c, style="Card.TFrame")
+        row.pack(fill="x")
+
+        def sync_now():
+            self._update_account_ui("Syncing…")
+            self._cloud_task(lambda: ACCOUNT.sync(), None)
+            win.destroy()
+
+        def sign_out():
+            if self._engine_busy():
+                return
+            ACCOUNT.sign_out()
+            win.destroy()
+            self._update_account_ui()
+            self._refresh_stats()
+            self._log(f"[{now_ist():%H:%M:%S}] Signed out. Showing data stored on this PC.")
+        ttk.Button(row, text="Sync now", style="Ghost.TButton", command=sync_now).pack(side="left")
+        ttk.Button(row, text="Sign out", style="Danger.TButton", command=sign_out).pack(side="right")
+        win.grab_set()
+
+    def _apply_settings(self, remote):
+        for k, v in remote.items():
+            if k in self.vars:
+                self.vars[k].set(str(v))
+        if "wma200_filter" in remote:
+            self.wma_var.set(bool(remote["wma200_filter"]))
+        self.cfg.update({k: v for k, v in remote.items() if k in DEFAULT_CONFIG})
+        save_config(self.cfg)
+        self._update_email_hint()
 
     def _launch(self, mode):
         if self.engine and self.engine.is_alive():
@@ -1202,12 +1931,14 @@ class App(tk.Tk):
                     self._refresh_stats()
                 elif kind == "progress":
                     self.progress.configure(maximum=ev[2], value=ev[1])
-                    self.status_var.set(f"Downloading daily history… {ev[1]}/{ev[2]}")
+                    self.status_var.set(f"Downloading price history… {ev[1]}/{ev[2]}")
                 elif kind == "rows":
                     self._show_rows(*ev[1:])
                 elif kind == "backtest":
                     self._refresh_stats()
                     messagebox.showinfo("Backtest", ev[1])
+                elif kind == "cloud":
+                    self._on_cloud(ev[1], ev[2])
                 elif kind == "notify":
                     self._notify(ev[1])
                 elif kind == "auth_error":
@@ -1226,6 +1957,23 @@ class App(tk.Tk):
         except queue.Empty:
             pass
         self.after(200, self._drain_events)
+
+    def _on_cloud(self, kind, payload):
+        if kind == "synced":
+            self._update_account_ui(f"☁ Synced {now_ist():%H:%M}")
+            self._refresh_stats()
+        elif kind == "restored":
+            self._update_account_ui(f"☁ Synced {now_ist():%H:%M}")
+            self._refresh_stats()
+            self._log(f"[{now_ist():%H:%M:%S}] Signed in as {ACCOUNT.email}.")
+        elif kind == "settings":
+            self._apply_settings(payload)
+            self._log(f"[{now_ist():%H:%M:%S}] Loaded your saved settings from your account.")
+        elif kind == "sync_error":
+            self._update_account_ui()
+            if ACCOUNT.signed_in:
+                self.sync_label.configure(text="⚠ Sync failed")
+            self._log(f"[{now_ist():%H:%M:%S}] Cloud sync: {payload}")
 
     def _copy_log(self):
         text = self.log_box.get("1.0", "end-1c")
