@@ -57,6 +57,8 @@ NIFTY_500_CSV_URLS = [
 ]
 BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
 
+APP_USER_AGENT = "BreakoutPredictor/1.0 (Python; Upstox API client)"
+
 MARKET_OPEN = (9, 15)
 MARKET_CLOSE = (15, 30)
 HISTORY_CALENDAR_DAYS = 365   # ~245 sessions: enough for indicators + a backtest
@@ -90,6 +92,16 @@ def today_str(dt=None):
 
 def is_market_open(dt):
     return dt.weekday() < 5 and MARKET_OPEN <= (dt.hour, dt.minute) <= MARKET_CLOSE
+
+
+def next_open(dt):
+    """Next weekday 09:15 IST at or after dt (NSE holidays not modelled)."""
+    cand = dt.replace(hour=MARKET_OPEN[0], minute=MARKET_OPEN[1], second=0, microsecond=0)
+    if cand <= dt:
+        cand += timedelta(days=1)
+    while cand.weekday() >= 5:
+        cand += timedelta(days=1)
+    return cand
 
 
 def clamp(x, lo=0.0, hi=1.0):
@@ -260,6 +272,10 @@ class AuthError(Exception):
     pass
 
 
+class BlockedError(Exception):
+    pass
+
+
 class RateLimiter:
     def __init__(self, per_second):
         self.interval = 1.0 / per_second
@@ -277,7 +293,9 @@ class RateLimiter:
 
 class UpstoxClient:
     def __init__(self, token):
-        self.headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        # Upstox's firewall rejects Python's default "Python-urllib" agent (Cloudflare 1010), so identify the app.
+        self.headers = {"Authorization": f"Bearer {token}", "Accept": "application/json",
+                        "User-Agent": APP_USER_AGENT}
 
     def get(self, path, params=None, limiter=None):
         url = API + path + ("?" + urllib.parse.urlencode(params) if params else "")
@@ -289,10 +307,15 @@ class UpstoxClient:
             except urllib.error.HTTPError as e:
                 if e.code == 401:
                     raise AuthError("Upstox rejected the token (401). It may have expired.")
+                if e.code == 403:
+                    body = e.read()[:400].decode("utf-8", "replace")
+                    if "1010" in body or "cloudflare" in body.lower():
+                        raise BlockedError("Upstox's firewall blocked this request (Cloudflare 1010).")
+                    raise RuntimeError(f"Upstox 403 on {path}: {body[:200]}")
                 if e.code == 429 or e.code >= 500:
                     time.sleep(2 * (attempt + 1))
                     continue
-                body = e.read()[:300].decode("utf-8", "replace")
+                body = e.read()[:600].decode("utf-8", "replace")
                 raise RuntimeError(f"Upstox {e.code} on {path}: {body}")
             except urllib.error.URLError:
                 time.sleep(2 * (attempt + 1))
@@ -374,10 +397,11 @@ def build_history(client, universe, log, progress, stop_event):
     limiter = RateLimiter(HISTORY_REQ_PER_SEC)
     history, done, auth_failures, errors = {}, 0, 0, 0
     lock = threading.Lock()
+    blocked = threading.Event()
 
     def fetch(item):
         nonlocal done, auth_failures, errors
-        if stop_event.is_set():
+        if stop_event.is_set() or blocked.is_set():
             return
         try:
             candles = client.daily_candles(item["key"], to_date, from_date, limiter)
@@ -394,6 +418,8 @@ def build_history(client, universe, log, progress, stop_event):
         except AuthError:
             with lock:
                 auth_failures += 1
+        except BlockedError:
+            blocked.set()
         except Exception as e:  # noqa: BLE001 - one bad symbol shouldn't stop the build
             with lock:
                 errors += 1
@@ -409,6 +435,9 @@ def build_history(client, universe, log, progress, stop_event):
 
     if stop_event.is_set():
         raise InterruptedError("Stopped")
+    if blocked.is_set():
+        raise BlockedError("Upstox's firewall blocked the history download (Cloudflare 1010). "
+                           "Try again later or from another network.")
     if auth_failures and not history:
         raise AuthError("Upstox rejected the token (401). It may have expired.")
     if len(history) < 400:
@@ -527,6 +556,7 @@ class Engine(threading.Thread):
         self.prepared_for = None
         self.history = self.setups = None
         self.logged_sample = False
+        self.preview_for = None
 
     def log(self, msg):
         self.events.put(("log", f"[{now_ist():%H:%M:%S}] {msg}"))
@@ -602,7 +632,18 @@ class Engine(threading.Thread):
                     self.log(f"Scan failed, retrying next minute: {e}")
                 wait = 60 - now_ist().second + 1
             else:
-                self.status(f"Market closed. Waiting... (last check {t:%H:%M:%S} IST)")
+                if self.preview_for != today_str(t):
+                    # Market closed: show setups for the next session from the last close (nothing emailed/logged).
+                    self.log("Market is closed. Showing setups for the next session from the last close.")
+                    try:
+                        self.scan_once(live=False)
+                    except AuthError:
+                        raise
+                    except Exception as e:  # noqa: BLE001 - keep the live loop alive
+                        self.log(f"Preview scan failed: {e}")
+                    self.preview_for = today_str(t)
+                self.status(f"Market closed · showing setups for the next session from the last close · "
+                            f"live checks start {next_open(t):%a %d %b, %H:%M} IST")
                 wait = 30
             self.stop_event.wait(wait)
         self.log("Live predictor stopped.")
@@ -977,11 +1018,30 @@ class App(tk.Tk):
                                     bg=P["surface"], fg=P["muted"], font=(FONT, 10), justify="center")
         self.empty_label.place(relx=0.5, rely=0.5, anchor="center")
 
-        outer, c = self._card(main, "Activity", padding=(18, 12))
+        outer, c = self._card(main, padding=(18, 12))
         outer.grid(row=3, column=0, sticky="ew", pady=(14, 0))
-        self.log_box = tk.Text(c, height=6, state="disabled", font=("Consolas", 9), bg=P["surface"],
-                               fg=P["muted"], relief="flat", borderwidth=0, highlightthickness=0, wrap="word")
-        self.log_box.pack(fill="x")
+        head = ttk.Frame(c, style="Card.TFrame")
+        head.pack(fill="x", pady=(0, 8))
+        ttk.Label(head, text="Activity", style="CardTitle.TLabel").pack(side="left")
+        self.copy_btn = ttk.Button(head, text="⧉  Copy", style="Ghost.TButton", command=self._copy_log)
+        self.copy_btn.pack(side="right")
+        self.wrap_var = tk.BooleanVar(value=True)
+        self.wrap_btn = ttk.Button(head, text="↵  Wrap: on", style="Ghost.TButton", command=self._toggle_wrap)
+        self.wrap_btn.pack(side="right", padx=(0, 8))
+        ttk.Button(head, text="Clear", style="Ghost.TButton", command=self._clear_log).pack(side="right", padx=(0, 8))
+
+        body = ttk.Frame(c, style="Card.TFrame")
+        body.pack(fill="x")
+        self.log_box = tk.Text(body, height=7, state="disabled", font=("Consolas", 9), bg=P["surface"],
+                               fg=P["muted"], relief="flat", borderwidth=0, highlightthickness=0, wrap="word",
+                               selectbackground=P["selected"], selectforeground=P["text"], cursor="xterm")
+        ysb = ttk.Scrollbar(body, orient="vertical", command=self.log_box.yview)
+        self.log_xsb = ttk.Scrollbar(c, orient="horizontal", command=self.log_box.xview)
+        self.log_box.configure(yscrollcommand=ysb.set, xscrollcommand=self.log_xsb.set)
+        ysb.pack(side="right", fill="y")
+        self.log_box.pack(side="left", fill="x", expand=True)
+        # Read-only but still selectable / Ctrl+C-able.
+        self.log_box.bind("<Control-a>", lambda e: (self.log_box.tag_add("sel", "1.0", "end"), "break")[1])
 
     # ------------------------------------------------------------------ helpers
     def _set_pill(self, state):
@@ -1166,6 +1226,28 @@ class App(tk.Tk):
         except queue.Empty:
             pass
         self.after(200, self._drain_events)
+
+    def _copy_log(self):
+        text = self.log_box.get("1.0", "end-1c")
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.copy_btn.configure(text="✓  Copied")
+        self.after(1500, lambda: self.copy_btn.configure(text="⧉  Copy"))
+
+    def _toggle_wrap(self):
+        on = not self.wrap_var.get()
+        self.wrap_var.set(on)
+        self.log_box.configure(wrap="word" if on else "none")
+        self.wrap_btn.configure(text=f"↵  Wrap: {'on' if on else 'off'}")
+        if on:
+            self.log_xsb.pack_forget()
+        else:
+            self.log_xsb.pack(fill="x", pady=(4, 0))
+
+    def _clear_log(self):
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
 
     def _log(self, msg):
         self.log_box.configure(state="normal")
