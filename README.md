@@ -45,7 +45,8 @@ Or create a desktop shortcut:
 powershell -ExecutionPolicy Bypass -File install_shortcut.ps1
 ```
 
-Paste your Upstox access token (a read-only Analytics token works) in the app. Upstox tokens expire daily.
+Paste your Upstox access token in the app. The read-only **Analytics token** (Upstox developer console → My Apps →
+Analytics) is valid for a year and covers everything this app uses; regular trading-app access tokens expire daily.
 
 ### Email alerts (optional)
 
