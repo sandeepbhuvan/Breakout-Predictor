@@ -32,6 +32,11 @@ through:
 4. **Result** – *target hit* or *stopped out* (if a single day touches both, it counts as stopped out), or *expired*
    after 30 sessions at that day's close.
 
+**Your own trades:** select a row and click **✎ My buy / sell** (or double-click it) to record the price and
+date/time you actually bought at, and optionally where you sold. The table then shows **APP P&L** for the app's
+recommended buy-in next to **MY P&L** for yours. Figures marked • are open positions, valued at the latest live price
+while the predictor runs, otherwise the last close; the rest are final. Your entries sync with your account.
+
 **Emails** (live predictor running, market hours, email set up, shared daily cap):
 - new likely breakouts (as before)
 - **BUY-IN** – a retesting stock moved above its retest day's high, with stop and target
@@ -86,12 +91,19 @@ Click **Email alerts** and enter SMTP details. For Gmail use `smtp.gmail.com`, p
 
 ## Accounts and cloud sync (optional, Firebase)
 
-Without an account the app stores everything on the PC. With a Firebase project, users can create an account in
-the app (**Sign in** in the header) and their predictions and settings sync to Firestore, so they follow them to any
-PC. Each user can only read their own data (see `firestore.rules`). Upstox tokens and SMTP passwords are never
-uploaded.
+Without an account the app stores everything on the PC. With an account (**Sign in → Create account** in the
+header) predictions, buy-ins and settings sync to Firestore, so they follow the user to any PC.
 
-One-time setup (free Spark plan is plenty):
+**Every copy of the app uses the app owner's shared Firebase project** (built into `breakout_predictor_app.py` as
+`BUILTIN_FIREBASE`), so users just create an account; there is nothing to set up. Each user can read and write only
+their own data (`firestore.rules`). The project owner can see all accounts and their data in the Firebase console.
+Upstox tokens and SMTP passwords are never uploaded.
+
+### Using a different Firebase project
+
+To point a copy at another project, create `firebase_config.json` next to the app (see
+`firebase_config.example.json`); it overrides the built-in project and is git-ignored. Setup for a new project
+(free Spark plan is plenty):
 
 1. Go to <https://console.firebase.google.com>, **Add project**, any name (Google Analytics not needed).
 2. **Build → Authentication → Get started → Sign-in method → Email/Password → Enable**.

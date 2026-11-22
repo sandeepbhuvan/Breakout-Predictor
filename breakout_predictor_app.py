@@ -682,13 +682,46 @@ def trade_rank(t):
     return 3 if s in TRADE_CLOSED else 2 if s == "entered" else 1 if s == "retesting" else 0
 
 
+MY_FIELDS = ("my_buy_price", "my_buy_time", "my_sell_price", "my_sell_time", "my_updated")
+
+
 def merge_trades(*lists):
-    out = {}
+    """App-tracked fields come from the most advanced copy; your own buy/sell fields from the most recent edit."""
+    out, mine = {}, {}
     for lst in lists:
         for t in lst or []:
-            if t["id"] not in out or trade_rank(t) > trade_rank(out[t["id"]]):
-                out[t["id"]] = t
+            tid = t["id"]
+            if tid not in out or trade_rank(t) > trade_rank(out[tid]):
+                out[tid] = dict(t)
+            if "my_updated" in t and t["my_updated"] >= mine.get(tid, {}).get("my_updated", ""):
+                mine[tid] = {k: t[k] for k in MY_FIELDS if k in t}
+    for tid, fields in mine.items():
+        for k in MY_FIELDS:
+            out[tid].pop(k, None)
+        out[tid].update(fields)
     return sorted(out.values(), key=lambda t: t.get("breakout_date", ""))
+
+
+def pct(a, b):
+    return (b - a) / a * 100 if a else None
+
+
+def app_pnl(t, price_now):
+    """(pct, realised?) for the app's recommended buy-in, or (None, False)."""
+    if t.get("status") in ("win", "loss", "expired") and t.get("return_pct") is not None:
+        return t["return_pct"], True
+    if t.get("status") == "entered" and t.get("entry_price") and price_now:
+        return pct(t["entry_price"], price_now), False
+    return None, False
+
+
+def my_pnl(t, price_now):
+    """(pct, realised?) for your own buy, against your sell price if set, else the latest price."""
+    if not t.get("my_buy_price"):
+        return None, False
+    if t.get("my_sell_price"):
+        return pct(t["my_buy_price"], t["my_sell_price"]), True
+    return (pct(t["my_buy_price"], price_now), False) if price_now else (None, False)
 
 
 def build_trades(preds, history, existing, target_pct):
@@ -702,20 +735,22 @@ def build_trades(preds, history, existing, target_pct):
             continue
         tid = pred_id(p)
         prev = old.get(tid)
-        if prev and prev.get("status") in TRADE_CLOSED:
-            out.append(prev)
-            continue
         s = by_symbol.get(p["symbol"])
-        if not s or p["resolved"] not in s["d"]:
+        if prev and prev.get("status") in TRADE_CLOSED:
+            t = dict(prev)
+        elif not s or p["resolved"] not in s["d"]:
             if prev:
                 out.append(prev)
             continue
-        t = simulate_trade(s, s["d"].index(p["resolved"]), p["R"], target_pct)
-        t.update(id=tid, symbol=p["symbol"], predicted=p["date"])
-        if prev:
-            for k, v in prev.items():
-                if k.startswith("alert_"):
-                    t[k] = v
+        else:
+            t = simulate_trade(s, s["d"].index(p["resolved"]), p["R"], target_pct)
+            t.update(id=tid, symbol=p["symbol"], predicted=p["date"])
+            if prev:
+                for k, v in prev.items():
+                    if k.startswith("alert_") or k in MY_FIELDS:
+                        t[k] = v
+        if s:
+            t["last_close"], t["last_date"] = s["c"][-1], s["d"][-1]
         out.append(t)
     known = {t["id"] for t in out}
     out += [t for t in existing if t["id"] not in known]
@@ -863,9 +898,17 @@ def fs_decode(v):
     return val  # stringValue, booleanValue, timestampValue
 
 
+# Shared Firebase project every copy of the app uses for accounts and sync. A Firebase Web API key only identifies
+# the project (it is meant to ship inside apps); firestore.rules is what keeps each user's data private.
+# A firebase_config.json next to the app overrides this, e.g. to point a copy at a different project.
+BUILTIN_FIREBASE = {"apiKey": "AIzaSyCmua-RymNtjeZRtlsfCpW3hjpDRndQXu8", "projectId": "breakout-predictor"}
+
+
 def load_firebase_config():
     cfg = read_json(FIREBASE_CONFIG_PATH, {}) or {}
-    return cfg if cfg.get("apiKey") and cfg.get("projectId") else None
+    if cfg.get("apiKey") and cfg.get("projectId"):
+        return cfg
+    return dict(BUILTIN_FIREBASE)
 
 
 class CloudAccount:
@@ -1263,6 +1306,12 @@ class Engine(threading.Thread):
         self.prepare()
         t = now_ist()
         quotes = self.client.quotes(list(self.setups.keys()))
+        prices = {}
+        for tr in load_trades():
+            k = self.key_by_symbol.get(tr["symbol"])
+            if k and (quotes.get(k) or {}).get("last_price"):
+                prices[tr["symbol"]] = float(quotes[k]["last_price"])
+        self.events.put(("prices", prices))
         thr, max_dist, min_price = float(self.cfg["min_score"]), float(self.cfg["max_dist_pct"]), float(self.cfg["min_price"])
 
         rows, stale = [], 0
@@ -1489,6 +1538,7 @@ class App(tk.Tk):
         self.mode = None
         self.vars = {}
         self.row_count = None
+        self.live_prices = {}
         self.smtp_pw_var = tk.StringVar(value=os.environ.get("HHLL_SMTP_PASSWORD", ""))
         global ACCOUNT
         ACCOUNT = CloudAccount(notify=lambda kind, payload: self.events.put(("cloud", kind, payload)))
@@ -1775,10 +1825,10 @@ class App(tk.Tk):
                                          "predictor runs during market hours,\nthen graded after up to 7 sessions.")
         self._set_track_filter("all")
 
-    BUYIN_COLUMNS = [("breakout", "BREAKOUT", 95, "w"), ("symbol", "STOCK", 105, "w"), ("R", "LEVEL", 90, "e"),
-                     ("retest", "RETEST", 95, "e"), ("entry_date", "BOUGHT", 95, "e"), ("entry", "ENTRY", 90, "e"),
-                     ("stop", "STOP", 85, "e"), ("target", "TARGET", 90, "e"), ("status", "STATUS", 175, "w"),
-                     ("result", "RESULT", 80, "e")]
+    BUYIN_COLUMNS = [("breakout", "BREAKOUT", 90, "w"), ("symbol", "STOCK", 100, "w"), ("R", "LEVEL", 85, "e"),
+                     ("entry", "APP BUY-IN", 135, "e"), ("stop", "STOP", 80, "e"), ("target", "TARGET", 85, "e"),
+                     ("status", "STATUS", 150, "w"), ("app_pnl", "APP P&L", 90, "e"), ("my_buy", "MY BUY", 135, "e"),
+                     ("my_pnl", "MY P&L", 90, "e")]
     BUYIN_FILTERS = {"all": None, "active": ("waiting_retest", "retesting", "entered"), "win": ("win",),
                      "loss": ("loss", "expired"), "none": ("failed", "no_retest", "no_entry")}
 
@@ -1794,6 +1844,8 @@ class App(tk.Tk):
             self.buyin_btns[name].pack(side="left", padx=(0, 6))
         self.buyin_summary = ttk.Label(bar, style="Hint.TLabel")
         self.buyin_summary.pack(side="right")
+        ttk.Button(bar, text="✎  My buy / sell", style="Ghost.TButton",
+                   command=self.open_my_trade_dialog).pack(side="right", padx=(0, 12))
         box = ttk.Frame(parent, style="Card.TFrame")
         box.pack(fill="both", expand=True)
         self.buyins = ttk.Treeview(box, columns=[col[0] for col in self.BUYIN_COLUMNS], show="headings",
@@ -1810,6 +1862,7 @@ class App(tk.Tk):
         self.buyins.configure(yscrollcommand=sb.set)
         self.buyins.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
+        self.buyins.bind("<Double-1>", lambda e: self.open_my_trade_dialog())
         self.buyin_empty = tk.Label(box, bg=P["surface"], fg=P["muted"], font=(FONT, 10), justify="center",
                                     text="No buy-ins yet.\nWhen a predicted stock breaks out it appears here, "
                                          "then moves to Retesting\nand In trade once it bounces above the "
@@ -1822,34 +1875,142 @@ class App(tk.Tk):
             b.configure(style="SegOn.TButton" if n == name else "Seg.TButton")
         self._refresh_buyins()
 
+    def _price_now(self, t):
+        return self.live_prices.get(t["symbol"]) or t.get("last_close")
+
     def _refresh_buyins(self):
         trades = load_trades()
         ts = trade_summary(trades)
         active = sum(1 for t in trades if t.get("status") in self.BUYIN_FILTERS["active"])
-        self.buyin_summary.configure(text=f"{active} active  ·  {ts['closed']} closed" +
-                                     (f"  ·  win rate {ts['win_rate']:.0f}%  ·  avg {ts['avg']:+.1f}%"
-                                      if ts["closed"] else ""))
+        mine = [p for p in (my_pnl(t, self._price_now(t))[0] for t in trades) if p is not None]
+        self.buyin_summary.configure(
+            text=f"{active} active  ·  {ts['closed']} closed"
+                 + (f"  ·  app avg {ts['avg']:+.1f}%" if ts["closed"] else "")
+                 + (f"  ·  my trades {len(mine)}, avg {sum(mine) / len(mine):+.1f}%" if mine else ""))
         self.buyins.delete(*self.buyins.get_children())
         allowed = self.BUYIN_FILTERS[self.buyin_filter]
         shown = [t for t in trades if allowed is None or t.get("status") in allowed]
         shown.sort(key=lambda t: t.get("breakout_date", ""), reverse=True)
         money = lambda v: f"₹{v:,.2f}" if v else "—"  # noqa: E731
+
+        def pnl_text(p):
+            val, realised = p
+            return "—" if val is None else f"{val:+.2f}%" + ("" if realised else " •")
+
         for t in shown:
             st = t.get("status")
             label = TRADE_LABELS.get(st, st)
             if st == "retesting" and t.get("buy_above"):
-                label = f"Retesting · buy above {money(t['buy_above'])}"
+                label = f"Buy above {money(t['buy_above'])}"
                 if t.get("alert_buy"):
-                    label = f"Buy triggered {money(t.get('alert_buy_price'))} ({t['alert_buy']} {t.get('alert_buy_time', '')})"
-            result = f"{t['return_pct']:+.2f}%" if t.get("return_pct") is not None else "—"
-            self.buyins.insert("", "end", tags=(st,), values=(
-                t.get("breakout_date", "—"), t["symbol"], money(t.get("R")), t.get("retest_date", "—"),
-                t.get("entry_date", "—"), money(t.get("entry_price")), money(t.get("stop")),
-                money(t.get("target")), label, result))
+                    label = f"Buy triggered {money(t.get('alert_buy_price'))}"
+            entry = (f"{money(t['entry_price'])} · {t['entry_date'][5:]}" if t.get("entry_price")
+                     else "—")
+            my_buy = "—"
+            if t.get("my_buy_price"):
+                my_buy = f"{money(t['my_buy_price'])} · {str(t.get('my_buy_time', ''))[5:10]}"
+            price_now = self._price_now(t)
+            self.buyins.insert("", "end", iid=t["id"], tags=(st,), values=(
+                t.get("breakout_date", "—"), t["symbol"], money(t.get("R")), entry, money(t.get("stop")),
+                money(t.get("target")), label, pnl_text(app_pnl(t, price_now)), my_buy,
+                pnl_text(my_pnl(t, price_now))))
         if shown:
             self.buyin_empty.place_forget()
         else:
             self.buyin_empty.place(relx=0.5, rely=0.5, anchor="center")
+
+    def open_my_trade_dialog(self):
+        sel = self.buyins.selection()
+        if not sel:
+            messagebox.showinfo("My buy / sell", "Select a stock in the Buy-ins table first (or double-click it).")
+            return
+        trades = load_trades()
+        tr = next((t for t in trades if t["id"] == sel[0]), None)
+        if not tr:
+            return
+        now = now_ist()
+        win = tk.Toplevel(self)
+        win.title(f"My trade · {tr['symbol']}")
+        win.configure(bg=P["bg"])
+        win.transient(self)
+        win.resizable(False, False)
+        outer, c = self._card(win, f"My trade · {tr['symbol']}")
+        outer.pack(fill="both", expand=True, padx=20, pady=20)
+        app_hint = (f"App buy-in: ₹{tr['entry_price']:,.2f} on {tr['entry_date']}" if tr.get("entry_price") else
+                    f"App buy-in: not triggered yet ({TRADE_LABELS.get(tr.get('status'), '')})")
+        ttk.Label(c, text=f"Breakout level ₹{tr['R']:,.2f}  ·  {app_hint}", style="Hint.TLabel").pack(
+            anchor="w", pady=(0, 12))
+
+        def split(ts):
+            ts = str(ts or "")
+            return (ts[:10], ts[11:16]) if ts else ("", "")
+
+        bd, bt = split(tr.get("my_buy_time"))
+        sd, st_ = split(tr.get("my_sell_time"))
+        v = {"buy": tk.StringVar(value=str(tr.get("my_buy_price") or "")),
+             "buy_d": tk.StringVar(value=bd or f"{now:%Y-%m-%d}"), "buy_t": tk.StringVar(value=bt or f"{now:%H:%M}"),
+             "sell": tk.StringVar(value=str(tr.get("my_sell_price") or "")),
+             "sell_d": tk.StringVar(value=sd), "sell_t": tk.StringVar(value=st_)}
+        grid = ttk.Frame(c, style="Card.TFrame")
+        grid.pack(fill="x")
+        for col, text in enumerate(["", "Price (₹)", "Date (YYYY-MM-DD)", "Time (HH:MM)"]):
+            ttk.Label(grid, text=text, style="Field.TLabel").grid(row=0, column=col, sticky="w", padx=(0, 10), pady=(0, 4))
+        for row, (label, keys) in enumerate([("I bought at", ("buy", "buy_d", "buy_t")),
+                                             ("I sold at (optional)", ("sell", "sell_d", "sell_t"))], start=1):
+            ttk.Label(grid, text=label, style="Card.TLabel").grid(row=row, column=0, sticky="w", padx=(0, 10), pady=4)
+            for col, (k, w) in enumerate(zip(keys, (12, 14, 8)), start=1):
+                ttk.Entry(grid, textvariable=v[k], width=w).grid(row=row, column=col, sticky="w", padx=(0, 10), pady=4)
+        error = tk.Label(c, bg=P["surface"], fg=P["red"], font=(FONT, 9), justify="left")
+        error.pack(anchor="w", pady=(8, 0))
+        ttk.Label(c, text="Leave 'sold at' empty while you still hold it; profit then uses the latest price.",
+                  style="Hint.TLabel").pack(anchor="w", pady=(4, 12))
+
+        def parse(price_s, d_s, t_s, required):
+            price_s, d_s, t_s = price_s.strip().replace(",", ""), d_s.strip(), t_s.strip() or "00:00"
+            if not price_s:
+                if required:
+                    raise ValueError("Enter the price you bought at.")
+                return None, None
+            price = float(price_s)
+            if price <= 0:
+                raise ValueError("Prices must be above 0.")
+            stamp = datetime.strptime(f"{d_s} {t_s}", "%Y-%m-%d %H:%M")
+            return round(price, 2), f"{stamp:%Y-%m-%d %H:%M}"
+
+        def save(clear=False):
+            try:
+                if clear:
+                    buy = sell = (None, None)
+                else:
+                    buy = parse(v["buy"].get(), v["buy_d"].get(), v["buy_t"].get(), True)
+                    sell = parse(v["sell"].get(), v["sell_d"].get() or v["buy_d"].get(), v["sell_t"].get(), False)
+                    if sell[1] and sell[1] < buy[1]:
+                        raise ValueError("The sell time is before the buy time.")
+            except ValueError as e:
+                msg = str(e)
+                error.configure(text=msg if not msg.startswith(("could not", "time data", "unconverted"))
+                                else "Check the numbers and the date/time format (YYYY-MM-DD, HH:MM).")
+                return
+            for t in trades:
+                if t["id"] == tr["id"]:
+                    t["my_buy_price"], t["my_buy_time"] = buy
+                    t["my_sell_price"], t["my_sell_time"] = sell
+                    for k in ("my_buy_price", "my_buy_time", "my_sell_price", "my_sell_time"):
+                        if t[k] is None:
+                            del t[k]
+                    t["my_updated"] = now_ist().strftime("%Y-%m-%d %H:%M:%S")
+            save_trades(trades)
+            win.destroy()
+            self._refresh_buyins()
+
+        row = ttk.Frame(c, style="Card.TFrame")
+        row.pack(fill="x")
+        if tr.get("my_buy_price"):
+            ttk.Button(row, text="Remove my trade", style="Danger.TButton",
+                       command=lambda: save(clear=True)).pack(side="left")
+        ttk.Button(row, text="Save", style="Accent.TButton", command=save).pack(side="right")
+        win.bind("<Return>", lambda e: save())
+        win.grab_set()
 
     def _show_tab(self, name):
         for n, frame in self.tabs.items():
@@ -2078,8 +2239,8 @@ class App(tk.Tk):
         submit = ttk.Button(row, style="Accent.TButton")
         submit.pack(side="right")
         note = ttk.Label(c, style="Hint.TLabel", wraplength=int(300 * self.k), justify="left",
-                         text="Your predictions and settings sync to your account. Upstox tokens and email "
-                              "passwords stay on this PC.")
+                         text="Your predictions, buy-ins and settings sync to your account, stored in the app "
+                              "owner's Firebase project. Upstox tokens and email passwords stay on this PC.")
         note.pack(anchor="w", pady=(14, 0))
 
         def set_mode(m):
@@ -2279,6 +2440,9 @@ class App(tk.Tk):
                     messagebox.showinfo("Backtest", ev[1])
                 elif kind == "cloud":
                     self._on_cloud(ev[1], ev[2])
+                elif kind == "prices":
+                    self.live_prices.update(ev[1])
+                    self._refresh_buyins()
                 elif kind == "notify":
                     self._notify(ev[1])
                 elif kind == "auth_error":
