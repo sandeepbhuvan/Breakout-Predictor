@@ -79,6 +79,7 @@ DEFAULT_CONFIG = {
     "email_to": "",
     "max_emails_per_day": 20,
     "wma200_filter": False,
+    "target_pct": 10.0,
 }
 WEEKLY_CALENDAR_DAYS = 1950   # ~5.3 years: 200 completed weeks before every backtest day
 WMA_WEEKS = 200
@@ -228,6 +229,76 @@ def proximity(R, price, max_dist):
     return 20 * (1 - dist / max_dist), dist
 
 
+# --------------------------------------------------------------------------- breakout -> retest -> buy-in
+
+RETEST_TOL = 0.015     # a retest touch: the day's low comes within 1.5% above the old ceiling...
+HOLD_BELOW = 0.01      # ...and the close stays no more than 1% below it
+FAIL_BELOW = 0.03      # a close 3%+ below the ceiling = failed breakout
+RETEST_WINDOW = 10     # sessions after the breakout to wait for a retest
+ENTRY_WINDOW = 5       # sessions after the latest retest touch to wait for the bounce
+MAX_HOLD = 30          # sessions to hold a buy-in before calling it expired
+STOP_BUFFER = 0.01     # stop sits 1% below the retest day's low
+
+TRADE_CLOSED = ("win", "loss", "expired", "failed", "no_retest", "no_entry")
+TRADE_LABELS = {"waiting_retest": "Waiting for retest", "retesting": "Retesting", "entered": "In trade",
+                "win": "✓ Target hit", "loss": "✗ Stopped out", "expired": "Expired",
+                "failed": "Failed breakout", "no_retest": "No retest", "no_entry": "No bounce"}
+
+
+def simulate_exit(S, entry_idx, entry, stop, target, n):
+    """Exits from the session after entry. Same-day stop and target counts as the stop (conservative).
+    Gaps fill at the open. Returns (status, exit_idx, exit_price) or None if still open at bar n."""
+    h, l, c = S["h"], S["l"], S["c"]
+    o = S.get("o")
+    for i in range(entry_idx + 1, n):
+        if l[i] <= stop:
+            return "loss", i, min(o[i], stop) if o else stop
+        if h[i] >= target:
+            return "win", i, max(o[i], target) if o else target
+        if i - entry_idx >= MAX_HOLD:
+            return "expired", i, c[i]
+    return None
+
+
+def simulate_trade(S, b, R, target_pct, n=None):
+    """Follow a breakout (close > R at index b) through retest, bounce entry and exit, using daily bars < n."""
+    n = len(S["c"]) if n is None else n
+    h, l, c, d = S["h"], S["l"], S["c"], S["d"]
+    o = S.get("o")
+    st = {"breakout_date": d[b], "R": R, "breakout_close": c[b], "status": "waiting_retest"}
+    retest = None
+    for i in range(b + 1, n):
+        if c[i] < R * (1 - FAIL_BELOW):
+            st.update(status="failed", closed_date=d[i])
+            return st
+        if retest is not None and h[i] > h[retest]:
+            trigger = h[retest]
+            entry = max(o[i], trigger) if o else trigger
+            stop = l[retest] * (1 - STOP_BUFFER)
+            target = entry * (1 + target_pct / 100)
+            st.update(status="entered", entry_date=d[i], entry_price=round(entry, 2), stop=round(stop, 2),
+                      target=round(target, 2))
+            ex = simulate_exit(S, i, entry, stop, target, n)
+            if ex:
+                status, j, price = ex
+                st.update(status=status, closed_date=d[j], exit_price=round(price, 2),
+                          return_pct=round((price - entry) / entry * 100, 2),
+                          r_multiple=round((price - entry) / max(entry - stop, 1e-9), 2))
+            return st
+        if l[i] <= R * (1 + RETEST_TOL) and c[i] >= R * (1 - HOLD_BELOW):
+            retest = i
+            st.update(status="retesting", retest_date=d[i], retest_low=l[i], retest_high=h[i],
+                      buy_above=round(h[i], 2), stop=round(l[i] * (1 - STOP_BUFFER), 2))
+            continue
+        if retest is None and i - b >= RETEST_WINDOW:
+            st.update(status="no_retest", closed_date=d[i])
+            return st
+        if retest is not None and i - retest >= ENTRY_WINDOW:
+            st.update(status="no_entry", closed_date=d[i])
+            return st
+    return st
+
+
 def backtest(history, cfg, stop_event=None, weekly=None):
     """Walk forward through stored history with the exact live rules.
 
@@ -238,6 +309,8 @@ def backtest(history, cfg, stop_event=None, weekly=None):
     buckets = {b: [0, 0] for b in ("<50", "50-60", "60-70", "70-80", "80+")}
     near, picked = [0, 0], [0, 0]
     split = {"above": [0, 0], "below": [0, 0], "no data": [0, 0]}
+    target_pct = float(cfg.get("target_pct") or 10)
+    trades, baseline_trades = [], []
     for key_, stock in history.items():
         if stop_event and stop_event.is_set():
             break
@@ -247,6 +320,7 @@ def backtest(history, cfg, stop_event=None, weekly=None):
         S = compute_series(stock)
         c = S["c"]
         w = weekly.get(key_) if weekly else None
+        seen_breakouts = set()
         for t in range(MIN_BARS - 1, n - HORIZON):
             if c[t] < min_price:
                 continue
@@ -266,6 +340,14 @@ def backtest(history, cfg, stop_event=None, weekly=None):
                     aggs.append(split[side])
                 if not use_filter or side == "above":
                     aggs.append(picked)
+                    b = next((j for j in range(t + 1, t + 1 + HORIZON) if c[j] > comp["R"]), None)
+                    if b is not None and b not in seen_breakouts:
+                        seen_breakouts.add(b)
+                        trades.append(simulate_trade(S, b, comp["R"], target_pct, n))
+                        stop = S["l"][b] * (1 - STOP_BUFFER)  # comparison: buy the breakout close, no retest
+                        ex = simulate_exit(S, b, c[b], stop, c[b] * (1 + target_pct / 100), n)
+                        if ex:
+                            baseline_trades.append({"status": ex[0], "return_pct": (ex[2] - c[b]) / c[b] * 100})
             for agg in aggs:
                 agg[0] += 1
                 agg[1] += hit
@@ -283,11 +365,40 @@ def backtest(history, cfg, stop_event=None, weekly=None):
                   "  If 'above' clearly beats 'below', the 200-week filter is worth switching on."]
     lines.append("  (Overlapping days on the same stock are counted separately.)")
     lines.append("  Judge the threshold by the LIFT over the baseline, not the absolute %.")
+
+    summary = trade_summary(trades)
+    base = trade_summary(baseline_trades)
+    retested = sum(1 for t in trades if t.get("retest_date"))
+    lines += ["",
+              f"Buy-ins: breakout, retest, then a move above the retest day's high "
+              f"(target +{target_pct:g}%, stop 1% below the retest low, max {MAX_HOLD} sessions)",
+              f"  Predicted breakouts: {len(trades):,}  |  retested: "
+              f"{retested / len(trades) * 100 if trades else 0:.0f}%  |  buy-ins: {summary['entries']:,} "
+              f"(closed: {summary['closed']:,})",
+              f"  {summary['text']}",
+              f"  For comparison, buying at the breakout close (stop below breakout day's low): {base['text']}",
+              "  No brokerage, taxes or slippage included."]
     if near[0] and picked[0]:
         write_json(APP_DIR / "backtest.json", {"baseline": near[1] / near[0] * 100,
                                                "setups": picked[1] / picked[0] * 100,
-                                               "min_score": thr, "date": today_str()})
+                                               "min_score": thr, "date": today_str(),
+                                               "buyin_win": summary["win_rate"], "buyin_avg": summary["avg"],
+                                               "buyin_closed": summary["closed"]})
     return "\n".join(lines)
+
+
+def trade_summary(trades):
+    closed = [t for t in trades if t.get("status") in ("win", "loss", "expired")]
+    entries = sum(1 for t in trades if t.get("status") in ("entered", "win", "loss", "expired"))
+    if not closed:
+        return {"entries": entries, "closed": 0, "win_rate": None, "avg": None, "text": "no closed trades yet"}
+    wins = sum(t["status"] == "win" for t in closed)
+    losses = sum(t["status"] == "loss" for t in closed)
+    avg = sum(t["return_pct"] for t in closed) / len(closed)
+    return {"entries": entries, "closed": len(closed), "win_rate": wins / len(closed) * 100, "avg": avg,
+            "text": f"target hit {wins / len(closed) * 100:.0f}%  |  stopped {losses / len(closed) * 100:.0f}%  |  "
+                    f"expired {(len(closed) - wins - losses) / len(closed) * 100:.0f}%  |  "
+                    f"avg return per trade {avg:+.2f}%  ({len(closed):,} trades)"}
 
 
 # =========================================================================== Upstox
@@ -480,7 +591,7 @@ def build_history(client, universe, log, progress, stop_event):
         if len(bars) < MIN_BARS:
             return None
         return {"symbol": item["symbol"], "industry": item["industry"],
-                "d": [str(b[0])[:10] for b in bars],
+                "d": [str(b[0])[:10] for b in bars], "o": [float(b[1]) for b in bars],
                 "h": [float(b[2]) for b in bars], "l": [float(b[3]) for b in bars],
                 "c": [float(b[4]) for b in bars], "v": [float(b[5]) for b in bars]}
 
@@ -554,6 +665,61 @@ def save_predictions(preds):
 
 def pred_id(p):
     return f"{p['date']}_{p['symbol']}"
+
+
+def load_trades():
+    return read_json(data_dir() / "trades.json", []) or []
+
+
+def save_trades(trades):
+    write_json(data_dir() / "trades.json", trades)
+    if ACCOUNT and ACCOUNT.signed_in:
+        ACCOUNT.queue_push(trades, "trades")
+
+
+def trade_rank(t):
+    s = t.get("status")
+    return 3 if s in TRADE_CLOSED else 2 if s == "entered" else 1 if s == "retesting" else 0
+
+
+def merge_trades(*lists):
+    out = {}
+    for lst in lists:
+        for t in lst or []:
+            if t["id"] not in out or trade_rank(t) > trade_rank(out[t["id"]]):
+                out[t["id"]] = t
+    return sorted(out.values(), key=lambda t: t.get("breakout_date", ""))
+
+
+def build_trades(preds, history, existing, target_pct):
+    """One buy-in record per prediction that broke out. Closed records are kept as they are; open ones are
+    recomputed from the latest daily bars. Live-alert flags on open records are preserved."""
+    by_symbol = {s["symbol"]: s for s in history.values()}
+    old = {t["id"]: t for t in existing}
+    out = []
+    for p in preds:
+        if p.get("status") != "hit" or not p.get("resolved"):
+            continue
+        tid = pred_id(p)
+        prev = old.get(tid)
+        if prev and prev.get("status") in TRADE_CLOSED:
+            out.append(prev)
+            continue
+        s = by_symbol.get(p["symbol"])
+        if not s or p["resolved"] not in s["d"]:
+            if prev:
+                out.append(prev)
+            continue
+        t = simulate_trade(s, s["d"].index(p["resolved"]), p["R"], target_pct)
+        t.update(id=tid, symbol=p["symbol"], predicted=p["date"])
+        if prev:
+            for k, v in prev.items():
+                if k.startswith("alert_"):
+                    t[k] = v
+        out.append(t)
+    known = {t["id"] for t in out}
+    out += [t for t in existing if t["id"] not in known]
+    return sorted(out, key=lambda t: t.get("breakout_date", ""))
 
 
 def merge_predictions(*lists):
@@ -823,10 +989,12 @@ class CloudAccount:
                                      "Firebase console.", 404) from None
                 raise
 
-    def pull_predictions(self):
+    ID_FN = {"predictions": pred_id, "trades": lambda t: t["id"]}
+
+    def pull_collection(self, coll):
         out, token = [], ""
         while True:
-            path = f"{self._root()}/users/{self.uid}/predictions?pageSize=300"
+            path = f"{self._root()}/users/{self.uid}/{coll}?pageSize=300"
             r = self._fs("GET", path + (f"&pageToken={urllib.parse.quote(token)}" if token else ""))
             for doc in r.get("documents", []):
                 out.append({k: fs_decode(v) for k, v in doc.get("fields", {}).items()})
@@ -834,9 +1002,13 @@ class CloudAccount:
             if not token:
                 return out
 
-    def _commit(self, preds):
-        writes = [{"update": {"name": f"{self._root()}/users/{self.uid}/predictions/{pred_id(p)}",
-                              "fields": {k: fs_encode(v) for k, v in p.items()}}} for p in preds]
+    def pull_predictions(self):
+        return self.pull_collection("predictions")
+
+    def _commit(self, items, coll="predictions"):
+        idf = self.ID_FN[coll]
+        writes = [{"update": {"name": f"{self._root()}/users/{self.uid}/{coll}/{idf(x)}",
+                              "fields": {k: fs_encode(v) for k, v in x.items()}}} for x in items]
         for i in range(0, len(writes), 400):
             self._fs("POST", f"{self._root()}:commit", {"writes": writes[i:i + 400]})
 
@@ -855,40 +1027,49 @@ class CloudAccount:
         self._fs("PATCH", f"{self._root()}/users/{self.uid}?updateMask.fieldPaths=settings&updateMask.fieldPaths=email",
                  {"fields": {"settings": fs_encode(settings), "email": fs_encode(self.email or "")}})
 
-    def sync(self, extra=None):
-        """Two-way merge of predictions. Returns the merged list (also saved locally)."""
-        remote = self.pull_predictions()
-        local = read_json(self.data_dir() / "predictions.json", []) or []
-        merged = merge_predictions(local, extra or [], remote)
-        write_json(self.data_dir() / "predictions.json", merged)
-        remote_by_id = {pred_id(p): json.dumps(p, sort_keys=True) for p in remote}
+    def _sync_collection(self, coll, merge_fn, extra=None):
+        idf = self.ID_FN[coll]
+        remote = self.pull_collection(coll)
+        local = read_json(self.data_dir() / f"{coll}.json", []) or []
+        merged = merge_fn(local, extra or [], remote)
+        write_json(self.data_dir() / f"{coll}.json", merged)
+        remote_by_id = {idf(x): json.dumps(x, sort_keys=True) for x in remote}
         with self.lock:
-            self.synced = dict(remote_by_id)
-        changed = [p for p in merged if remote_by_id.get(pred_id(p)) != json.dumps(p, sort_keys=True)]
+            self.synced[coll] = dict(remote_by_id)
+        changed = [x for x in merged if remote_by_id.get(idf(x)) != json.dumps(x, sort_keys=True)]
         if changed:
-            self._commit(changed)
+            self._commit(changed, coll)
             with self.lock:
-                for p in changed:
-                    self.synced[pred_id(p)] = json.dumps(p, sort_keys=True)
+                for x in changed:
+                    self.synced[coll][idf(x)] = json.dumps(x, sort_keys=True)
+        return merged
+
+    def sync(self, extra=None):
+        """Two-way merge of predictions and buy-ins. Returns the merged predictions (also saved locally)."""
+        merged = self._sync_collection("predictions", merge_predictions, extra)
+        self._sync_collection("trades", merge_trades)
         self.notify("synced", len(merged))
         return merged
 
-    def queue_push(self, preds):
+    def queue_push(self, items, coll="predictions"):
+        idf = self.ID_FN[coll]
         with self.lock:
-            changed = [p for p in preds if self.synced.get(pred_id(p)) != json.dumps(p, sort_keys=True)]
+            done = self.synced.setdefault(coll, {})
+            changed = [x for x in items if done.get(idf(x)) != json.dumps(x, sort_keys=True)]
         if changed:
-            self.push_q.put(changed)
+            self.push_q.put((coll, changed))
 
     def _pusher(self):
         while True:
-            batch = self.push_q.get()
+            coll, batch = self.push_q.get()
             if not self.signed_in:
                 continue
             try:
-                self._commit(batch)
+                self._commit(batch, coll)
+                idf = self.ID_FN[coll]
                 with self.lock:
-                    for p in batch:
-                        self.synced[pred_id(p)] = json.dumps(p, sort_keys=True)
+                    for x in batch:
+                        self.synced.setdefault(coll, {})[idf(x)] = json.dumps(x, sort_keys=True)
                 self.notify("synced", None)
             except Exception as e:  # noqa: BLE001 - stays dirty; retried on the next save or sync
                 self.notify("sync_error", str(e))
@@ -931,6 +1112,28 @@ def alert_html(rows, cfg, when, stats):
             f"within {HORIZON} sessions. {stats}. These are probabilistic setups, not certainties.</p></div>")
 
 
+def trade_alert_html(events, when, cfg):
+    td = "padding:6px 8px;border-bottom:1px solid #ddd;"
+    color = {"BUY-IN": "#1a5fb4", "TARGET HIT": "#0f7b3e", "STOPPED OUT": "#c0392b"}
+    money = lambda v: f"&#8377;{v:,.2f}" if v else "&mdash;"  # noqa: E731
+    body = "".join(
+        f"<tr><td style='{td}font-weight:bold;color:{color[e['kind']]}'>{e['kind']}</td>"
+        f"<td style='{td}font-weight:bold'>{e['symbol']}</td><td style='{td}'>{money(e['price'])}</td>"
+        f"<td style='{td}'>{money(e.get('entry'))}</td><td style='{td}'>{money(e['R'])}</td>"
+        f"<td style='{td}'>{money(e.get('stop'))}</td><td style='{td}'>{money(e.get('target'))}</td></tr>"
+        for e in events)
+    head = "".join(f"<th style='padding:6px 8px;border-bottom:2px solid #ccc;text-align:left'>{h}</th>" for h in
+                   ["Signal", "Stock", "Price now", "Entry", "Breakout level", "Stop", "Target"])
+    return (f"<div style='font-family:Arial,sans-serif;color:#222'>"
+            f"<h2 style='margin-bottom:4px'>Breakout retest signals</h2>"
+            f"<p style='color:#666;margin-top:0'>{when.strftime('%d %b %Y, %I:%M %p')} IST | Upstox live</p>"
+            f"<table style='border-collapse:collapse;font-size:14px'><thead><tr style='background:#f4f6f8'>{head}"
+            f"</tr></thead><tbody>{body}</tbody></table>"
+            f"<p style='color:#666'><b>BUY-IN</b>: a predicted breakout came back to retest its old ceiling and has now "
+            f"moved above the retest day's high. Stop is 1% below the retest low; target is "
+            f"+{float(cfg.get('target_pct') or 10):g}% from entry. Probabilistic signals, not investment advice.</p></div>")
+
+
 # =========================================================================== engine
 
 class Engine(threading.Thread):
@@ -946,6 +1149,7 @@ class Engine(threading.Thread):
         self.logged_sample = False
         self.universe = None
         self.weekly = None
+        self.key_by_symbol = {}
         self.preview_for = None
 
     def log(self, msg):
@@ -1007,6 +1211,9 @@ class Engine(threading.Thread):
             self.weekly = build_weekly(self.client, universe, self.log, progress, self.stop_event)
         preds = grade_predictions(load_predictions(), self.history)
         save_predictions(preds)
+        trades = build_trades(preds, self.history, load_trades(), float(self.cfg.get("target_pct") or 10))
+        save_trades(trades)
+        self.key_by_symbol = {s["symbol"]: k for k, s in self.history.items()}
         self.events.put(("stats", prediction_stats(preds)))
 
         self.setups = {}
@@ -1098,6 +1305,8 @@ class Engine(threading.Thread):
                          {p["symbol"]: p["date"] for p in preds if p["status"] == "open"}))
         self.status(f"{t:%H:%M:%S} IST - {len(rows)} likely breakouts, {len(fresh)} new"
                     + ("" if live else " (dry run: nothing logged or emailed)"))
+        if live:
+            self.check_trades_live(quotes, t)
         if not live or not fresh:
             return
 
@@ -1109,6 +1318,11 @@ class Engine(threading.Thread):
         self.events.put(("stats", stats))
         self.log(f"New predictions: {', '.join(r['symbol'] for r in fresh)}")
 
+        subject = f"Nifty 500: {len(fresh)} likely breakout(s) within {HORIZON} days - {t:%d %b %H:%M}"
+        self.send_alert(subject, alert_html(fresh, self.cfg, t, stats), t)
+        self.events.put(("notify", len(fresh)))
+
+    def send_alert(self, subject, html, t):
         state_path = APP_DIR / f"emails_{today_str(t)}.json"
         state = read_json(state_path, {"sent": 0})
         if not self.email_enabled():
@@ -1116,15 +1330,50 @@ class Engine(threading.Thread):
         elif state["sent"] >= int(self.cfg["max_emails_per_day"]):
             self.log("Daily email cap reached; shown here only.")
         else:
-            subject = f"Nifty 500: {len(fresh)} likely breakout(s) within {HORIZON} days - {t:%d %b %H:%M}"
             try:
-                send_email(self.cfg, self.smtp_password, subject, alert_html(fresh, self.cfg, t, stats))
+                send_email(self.cfg, self.smtp_password, subject, html)
                 state["sent"] += 1
                 write_json(state_path, state)
-                self.log(f"Email sent to {self.cfg['email_to']}")
+                self.log(f"Email sent to {self.cfg['email_to']}: {subject}")
             except Exception as e:  # noqa: BLE001
                 self.log(f"Email failed: {e}")
-        self.events.put(("notify", len(fresh)))
+
+    def check_trades_live(self, quotes, t):
+        """Live buy-in triggers (retesting -> price above the retest day's high) and exits (target / stop).
+        The daily rebuild each morning stays the record; these are the real-time alerts, sent once each."""
+        trades = load_trades()
+        events, today = [], today_str(t)
+        for tr in trades:
+            key = self.key_by_symbol.get(tr["symbol"])
+            q = quotes.get(key) if key else None
+            if not q or not q.get("last_price"):
+                continue
+            ltp = float(q["last_price"])
+            if tr["status"] == "retesting" and tr.get("buy_above") and ltp > tr["buy_above"] \
+                    and tr.get("alert_buy") != today:
+                tr["alert_buy"], tr["alert_buy_price"], tr["alert_buy_time"] = today, ltp, f"{t:%H:%M}"
+                target = ltp * (1 + float(self.cfg.get("target_pct") or 10) / 100)
+                events.append({"kind": "BUY-IN", "symbol": tr["symbol"], "price": ltp, "R": tr["R"],
+                               "stop": tr.get("stop"), "target": round(target, 2)})
+            elif tr["status"] == "entered" and not tr.get("alert_exit"):
+                if tr.get("stop") and ltp <= tr["stop"]:
+                    tr["alert_exit"] = f"stop {today} {t:%H:%M}"
+                    events.append({"kind": "STOPPED OUT", "symbol": tr["symbol"], "price": ltp, "R": tr["R"],
+                                   "stop": tr["stop"], "target": tr.get("target"), "entry": tr.get("entry_price")})
+                elif tr.get("target") and ltp >= tr["target"]:
+                    tr["alert_exit"] = f"target {today} {t:%H:%M}"
+                    events.append({"kind": "TARGET HIT", "symbol": tr["symbol"], "price": ltp, "R": tr["R"],
+                                   "stop": tr.get("stop"), "target": tr["target"], "entry": tr.get("entry_price")})
+        if not events:
+            return
+        save_trades(trades)
+        self.events.put(("stats", None))
+        self.log("Buy-in alerts: " + ", ".join(f"{e['kind']} {e['symbol']} @ ₹{e['price']:,.2f}" for e in events))
+        kinds = sorted({e["kind"] for e in events})
+        subject = (f"{' / '.join(kinds)}: " + ", ".join(e["symbol"] for e in events[:5])
+                   + (" …" if len(events) > 5 else "") + f" - {t:%d %b %H:%M}")
+        self.send_alert(subject, trade_alert_html(events, t, self.cfg), t)
+        self.events.put(("notify", len(events)))
 
 
 # =========================================================================== icon
@@ -1384,14 +1633,13 @@ class App(tk.Tk):
         outer.pack(fill="x", pady=(0, 14))
         self.token_var = self._field(c, "Upstox access token",
                                      var=tk.StringVar(value=os.environ.get("UPSTOX_ACCESS_TOKEN", "")), show="•")
-        self._field(c, "Nifty 500 CSV path (optional)", "nifty_csv_path")
 
         outer, c = self._card(side, "Prediction rules")
         outer.pack(fill="x", pady=(0, 14))
         grid = ttk.Frame(c, style="Card.TFrame")
         grid.pack(fill="x")
         for i, (k, label) in enumerate([("min_score", "Min setup score"), ("max_dist_pct", "Max % below 20D high"),
-                                        ("min_price", "Min price (₹)")]):
+                                        ("min_price", "Min price (₹)"), ("target_pct", "Buy-in profit target %")]):
             ttk.Label(grid, text=label, style="Card.TLabel").grid(row=i, column=0, sticky="w", pady=5)
             self.vars[k] = tk.StringVar(value=str(self.cfg[k]))
             ttk.Entry(grid, textvariable=self.vars[k], width=8, justify="right").grid(row=i, column=1, sticky="e", pady=5)
@@ -1420,7 +1668,7 @@ class App(tk.Tk):
         stats = ttk.Frame(main, style="Bg.TFrame")
         stats.grid(row=0, column=0, sticky="ew")
         self.stat = {}
-        for i, (key, label) in enumerate([("now", "LIKELY BREAKOUTS"), ("today", "NEW TODAY"),
+        for i, (key, label) in enumerate([("now", "LIKELY BREAKOUTS"), ("buyin", "BUY-IN WIN RATE"),
                                           ("hit", "TRACKED HIT RATE"), ("lift", "BACKTEST LIFT")]):
             stats.columnconfigure(i, weight=1, uniform="stat")
             outer, c = self._card(stats, padding=(18, 14))
@@ -1440,7 +1688,7 @@ class App(tk.Tk):
         head = ttk.Frame(c, style="Card.TFrame")
         head.pack(fill="x", pady=(0, 10))
         self.tab_btns = {}
-        for name, text in [("live", "Live setups"), ("track", "Track record")]:
+        for name, text in [("live", "Live setups"), ("buyins", "Buy-ins"), ("track", "Track record")]:
             self.tab_btns[name] = ttk.Button(head, text=text, style="Seg.TButton", width=-4,
                                              command=lambda n=name: self._show_tab(n))
             self.tab_btns[name].pack(side="left", padx=(0, 6))
@@ -1449,8 +1697,9 @@ class App(tk.Tk):
 
         holder = ttk.Frame(c, style="Card.TFrame")
         holder.pack(fill="both", expand=True)
-        self.tabs = {"live": ttk.Frame(holder, style="Card.TFrame"), "track": ttk.Frame(holder, style="Card.TFrame")}
+        self.tabs = {n: ttk.Frame(holder, style="Card.TFrame") for n in ("live", "buyins", "track")}
         self._build_track(self.tabs["track"])
+        self._build_buyins(self.tabs["buyins"])
         tbl = self.tabs["live"]
         self.tree = ttk.Treeview(tbl, columns=[col[0] for col in self.COLUMNS], show="headings", selectmode="browse")
         for key, title, width, anchor in self.COLUMNS:
@@ -1526,15 +1775,96 @@ class App(tk.Tk):
                                          "predictor runs during market hours,\nthen graded after up to 7 sessions.")
         self._set_track_filter("all")
 
+    BUYIN_COLUMNS = [("breakout", "BREAKOUT", 95, "w"), ("symbol", "STOCK", 105, "w"), ("R", "LEVEL", 90, "e"),
+                     ("retest", "RETEST", 95, "e"), ("entry_date", "BOUGHT", 95, "e"), ("entry", "ENTRY", 90, "e"),
+                     ("stop", "STOP", 85, "e"), ("target", "TARGET", 90, "e"), ("status", "STATUS", 175, "w"),
+                     ("result", "RESULT", 80, "e")]
+    BUYIN_FILTERS = {"all": None, "active": ("waiting_retest", "retesting", "entered"), "win": ("win",),
+                     "loss": ("loss", "expired"), "none": ("failed", "no_retest", "no_entry")}
+
+    def _build_buyins(self, parent):
+        bar = ttk.Frame(parent, style="Card.TFrame")
+        bar.pack(fill="x", pady=(0, 8))
+        self.buyin_filter = "all"
+        self.buyin_btns = {}
+        for name, text in [("all", "All"), ("active", "Active"), ("win", "Target hit"), ("loss", "Stopped / expired"),
+                           ("none", "No entry")]:
+            self.buyin_btns[name] = ttk.Button(bar, text=text, style="Seg.TButton", width=-4,
+                                               command=lambda n=name: self._set_buyin_filter(n))
+            self.buyin_btns[name].pack(side="left", padx=(0, 6))
+        self.buyin_summary = ttk.Label(bar, style="Hint.TLabel")
+        self.buyin_summary.pack(side="right")
+        box = ttk.Frame(parent, style="Card.TFrame")
+        box.pack(fill="both", expand=True)
+        self.buyins = ttk.Treeview(box, columns=[col[0] for col in self.BUYIN_COLUMNS], show="headings",
+                                   selectmode="browse")
+        for key, title, width, anchor in self.BUYIN_COLUMNS:
+            self.buyins.heading(key, text=title, anchor=anchor)
+            self.buyins.column(key, width=int(width * self.k), anchor=anchor, stretch=key == "status")
+        for tag, color in [("win", P["green"]), ("loss", P["red"]), ("expired", P["amber"]), ("entered", P["accent"]),
+                           ("retesting", P["amber"]), ("waiting_retest", P["text"])]:
+            self.buyins.tag_configure(tag, foreground=color)
+        for tag in ("failed", "no_retest", "no_entry"):
+            self.buyins.tag_configure(tag, foreground=P["muted"])
+        sb = ttk.Scrollbar(box, orient="vertical", command=self.buyins.yview)
+        self.buyins.configure(yscrollcommand=sb.set)
+        self.buyins.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.buyin_empty = tk.Label(box, bg=P["surface"], fg=P["muted"], font=(FONT, 10), justify="center",
+                                    text="No buy-ins yet.\nWhen a predicted stock breaks out it appears here, "
+                                         "then moves to Retesting\nand In trade once it bounces above the "
+                                         "retest day's high.")
+        self._set_buyin_filter("all")
+
+    def _set_buyin_filter(self, name):
+        self.buyin_filter = name
+        for n, b in self.buyin_btns.items():
+            b.configure(style="SegOn.TButton" if n == name else "Seg.TButton")
+        self._refresh_buyins()
+
+    def _refresh_buyins(self):
+        trades = load_trades()
+        ts = trade_summary(trades)
+        active = sum(1 for t in trades if t.get("status") in self.BUYIN_FILTERS["active"])
+        self.buyin_summary.configure(text=f"{active} active  ·  {ts['closed']} closed" +
+                                     (f"  ·  win rate {ts['win_rate']:.0f}%  ·  avg {ts['avg']:+.1f}%"
+                                      if ts["closed"] else ""))
+        self.buyins.delete(*self.buyins.get_children())
+        allowed = self.BUYIN_FILTERS[self.buyin_filter]
+        shown = [t for t in trades if allowed is None or t.get("status") in allowed]
+        shown.sort(key=lambda t: t.get("breakout_date", ""), reverse=True)
+        money = lambda v: f"₹{v:,.2f}" if v else "—"  # noqa: E731
+        for t in shown:
+            st = t.get("status")
+            label = TRADE_LABELS.get(st, st)
+            if st == "retesting" and t.get("buy_above"):
+                label = f"Retesting · buy above {money(t['buy_above'])}"
+                if t.get("alert_buy"):
+                    label = f"Buy triggered {money(t.get('alert_buy_price'))} ({t['alert_buy']} {t.get('alert_buy_time', '')})"
+            result = f"{t['return_pct']:+.2f}%" if t.get("return_pct") is not None else "—"
+            self.buyins.insert("", "end", tags=(st,), values=(
+                t.get("breakout_date", "—"), t["symbol"], money(t.get("R")), t.get("retest_date", "—"),
+                t.get("entry_date", "—"), money(t.get("entry_price")), money(t.get("stop")),
+                money(t.get("target")), label, result))
+        if shown:
+            self.buyin_empty.place_forget()
+        else:
+            self.buyin_empty.place(relx=0.5, rely=0.5, anchor="center")
+
     def _show_tab(self, name):
         for n, frame in self.tabs.items():
             frame.pack_forget()
             self.tab_btns[n].configure(style="SegOn.TButton" if n == name else "Seg.TButton")
         self.tabs[name].pack(fill="both", expand=True)
-        self.tab_hint.configure(text="highlighted rows are new  ·  sorted by score" if name == "live" else
-                                f"hit = a close above the breakout level within {HORIZON} sessions  ·  newest first")
+        self.tab_hint.configure(text={
+            "live": "highlighted rows are new  ·  sorted by score",
+            "buyins": "predicted breakout → retest → buy above the retest day's high  ·  stop 1% under "
+                      "the retest low",
+            "track": f"hit = a close above the breakout level within {HORIZON} sessions  ·  newest first"}[name])
         if name == "track":
             self._refresh_track()
+        if name == "buyins":
+            self._refresh_buyins()
 
     def _set_track_filter(self, name):
         self.track_filter = name
@@ -1597,9 +1927,18 @@ class App(tk.Tk):
         miss = sum(p["status"] == "miss" for p in preds)
         opened = sum(p["status"] == "open" for p in preds)
         self.stat["now"][0].configure(text="—" if self.row_count is None else str(self.row_count))
-        self.stat["now"][1].configure(text="from the latest scan")
-        self.stat["today"][0].configure(text=str(sum(p["date"] == today for p in preds)))
-        self.stat["today"][1].configure(text=f"{opened} predictions still open")
+        self.stat["now"][1].configure(text=f"{sum(p['date'] == today for p in preds)} new today  ·  {opened} open")
+        ts = trade_summary(load_trades())
+        if ts["closed"]:
+            self.stat["buyin"][0].configure(text=f"{ts['win_rate']:.0f}%",
+                                            foreground=P["green"] if ts["avg"] > 0 else P["red"])
+            self.stat["buyin"][1].configure(text=f"{ts['closed']} closed  ·  avg {ts['avg']:+.1f}% per trade")
+        else:
+            active = sum(1 for t in load_trades() if t.get("status") in ("waiting_retest", "retesting", "entered"))
+            self.stat["buyin"][0].configure(text="—", foreground=P["text"])
+            self.stat["buyin"][1].configure(text=f"{active} active  ·  no closed trades yet")
+        if hasattr(self, "buyins"):
+            self._refresh_buyins()
         self.stat["hit"][0].configure(text=f"{hit / (hit + miss) * 100:.0f}%" if hit + miss else "—",
                                       foreground=P["text"])
         self.stat["hit"][1].configure(text=f"{hit} hit  ·  {miss} missed" if hit + miss else "graded after 7 sessions")
@@ -1654,6 +1993,7 @@ class App(tk.Tk):
             cfg["smtp_port"] = int(cfg["smtp_port"] or 465)
             cfg["max_emails_per_day"] = int(cfg["max_emails_per_day"] or 20)
             cfg["wma200_filter"] = bool(self.wma_var.get())
+            cfg["target_pct"] = float(cfg.get("target_pct") or 10)
         except ValueError:
             messagebox.showerror("Settings", "Score, distance, price, port and max emails must be numbers.")
             return None

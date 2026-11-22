@@ -18,6 +18,29 @@ Pure Python standard library (Tkinter + urllib). Nothing to `pip install`.
    within 7 sessions. The **Track record** tab lists every prediction with its result, the date it resolved, how
    many sessions it took and the price move, filterable by hits, misses and open.
 
+### Buy-ins: breakout, retest, bounce
+
+Every predicted stock that breaks out (closes above its 20-day high) moves to the **Buy-ins** tab and is followed
+through:
+
+1. **Waiting for retest** – up to 10 sessions for the price to come back to the old ceiling: a day whose low is within
+   1.5% above it and whose close stays no more than 1% below it. A close 3%+ below the ceiling = *failed breakout*.
+2. **Retesting** – the buy trigger is the retest day's high. Each new retest touch resets it. No move above it within
+   5 sessions = *no bounce*.
+3. **In trade** – entry when price goes above the retest day's high (at the open if it gaps above). Stop 1% below the
+   retest day's low; target **+10%** (setting *Buy-in profit target %*).
+4. **Result** – *target hit* or *stopped out* (if a single day touches both, it counts as stopped out), or *expired*
+   after 30 sessions at that day's close.
+
+**Emails** (live predictor running, market hours, email set up, shared daily cap):
+- new likely breakouts (as before)
+- **BUY-IN** – a retesting stock moved above its retest day's high, with stop and target
+- **TARGET HIT** / **STOPPED OUT** for stocks in a trade
+
+Each alert is sent once. The daily rebuild from completed candles each morning is the official record; live alerts
+use the price at that minute. **Run backtest** reports the buy-in win rate and average return, next to buying at the
+breakout close, so you can see whether waiting for the retest pays. Brokerage, taxes and slippage aren't included.
+
 ### Optional 200-week moving-average filter
 
 Tick **Only stocks above 200-week MA** to drop setups trading below their 200-week simple moving average (a
@@ -74,6 +97,8 @@ One-time setup (free Spark plan is plenty):
 2. **Build → Authentication → Get started → Sign-in method → Email/Password → Enable**.
 3. **Build → Firestore Database → Create database**, location `asia-south1 (Mumbai)`, start in **production mode**.
 4. In Firestore, open the **Rules** tab, replace the contents with [`firestore.rules`](firestore.rules), **Publish**.
+   (If you set this up before buy-ins existed, publish the current file again: it now covers every collection
+   under your user.)
 5. **Project settings (gear) → General**: copy the **Project ID** and **Web API key**. (If no Web API key shows,
    add a Web app with the `</>` button; you don't need its hosting or SDK snippet.)
 6. Copy `firebase_config.example.json` to `firebase_config.json` next to the app and fill in both values.
