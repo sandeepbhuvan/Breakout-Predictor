@@ -6,6 +6,108 @@ It emails you only when new setups appear.
 
 Pure Python standard library (Tkinter + urllib). Nothing to `pip install`.
 
+![Breakout Predictor](docs/images/overview.png)
+
+## How to use
+
+Click **?** in the top-right corner of the app (or press **F1**) to open this guide inside the app. The screenshots
+use made-up demo stocks.
+
+### 1. Paste your Upstox token
+
+Upstox developer console → **My Apps → Analytics token** (read-only, valid for a year). Paste it under
+**Connection**. It stays in memory only and is never saved or uploaded.
+
+<img src="docs/images/connection.png" width="330" alt="Connection card">
+
+### 2. Set your rules
+
+- **Min setup score**: how strict predictions are (65 is a good start).
+- **Max % below 20D high**: how close to the breakout level a stock must be.
+- **Min price**: skips penny stocks.
+- **Buy-in profit target %**: target for buy-ins (10% by default).
+- **Only stocks above 200-week MA**: keep only long-term uptrends.
+
+<img src="docs/images/rules.png" width="330" alt="Prediction rules card">
+
+### 3. Run it
+
+- **Start live predictor**: scans every minute while the market is open (09:15–15:30 IST, Mon–Fri) and emails new
+  setups and buy-in signals.
+- **Scan now**: a single scan without emails, for a quick look.
+- **Run backtest**: replays the rules over the past year so you can see whether they work.
+
+The first run of the day downloads about a year of candles, which takes a few minutes.
+
+<img src="docs/images/actions.png" width="330" alt="Actions card">
+
+### 4. Read the scoreboard
+
+- **LIKELY BREAKOUTS**: setups right now.
+- **BUY-IN WIN RATE**: share of closed buy-ins that hit the target.
+- **TRACKED HIT RATE**: share of past predictions that broke out within 7 sessions.
+- **BACKTEST LIFT**: how many percentage points more often the picks broke out than every stock near its 20-day
+  high. Positive means the score helps.
+
+![Stat cards](docs/images/stats.png)
+
+### 5. Live setups
+
+Each row is a predicted breakout:
+
+- **BREAKOUT LEVEL**: the 20-day high to beat.
+- **DISTANCE**: how far below it the price is.
+- **SCORE**: 0–100.
+- **WHY**: what pushed the score up.
+
+Highlighted rows are new in this scan. When the market is closed, the tab previews the next session.
+
+![Live setups](docs/images/live.png)
+
+### 6. Buy-ins
+
+Predicted stocks that break out move here and are followed through each stage: **Waiting for retest → Buy above ₹X →
+In trade → Target hit / Stopped out / Expired**. **APP BUY-IN**, **STOP** and **TARGET** are the app's plan. The
+filters show active trades, winners, losers or stocks that never gave an entry.
+
+![Buy-ins](docs/images/buyins.png)
+
+### 7. Record your own trade
+
+Select a row and click **✎ My buy / sell** (or double-click it). Enter the price, date and time you bought at, and
+optionally where you sold. **MY P&L** then sits next to **APP P&L**. A **•** marks a position that's still open,
+valued at the live price (or the last close).
+
+<img src="docs/images/mytrade.png" width="520" alt="My trade dialog">
+
+### 8. Track record
+
+Every live prediction is graded automatically. A **hit** is a daily close above the breakout level within 7 sessions;
+anything else is a **miss**. Filter by hits, misses or open.
+
+![Track record](docs/images/track.png)
+
+### 9. Email alerts, account and help
+
+- **Email** opens the SMTP settings.
+- **Account** signs you in so your data follows you to any PC.
+- The pill shows whether the predictor is running.
+- **?** opens the guide.
+
+<img src="docs/images/header.png" width="540" alt="Header buttons">
+
+### 10. Activity log
+
+The log shows what the app is doing: downloads, scans, alerts and errors.
+
+- **Copy** puts the whole log on the clipboard, handy for reporting a problem.
+- **Wrap** toggles line wrapping.
+
+![Activity log](docs/images/activity.png)
+
+To regenerate these screenshots after a UI change, run `py tools/make_screenshots.py` (Windows). It uses demo data in
+a temporary folder and captures only the app's own window.
+
 ## How it works
 
 1. **Once a day** it downloads about a year of daily candles for every Nifty 500 stock from Upstox (throttled,
@@ -86,7 +188,7 @@ Analytics) is valid for a year and covers everything this app uses; regular trad
 
 ### Email alerts (optional)
 
-Click **Email alerts** and enter SMTP details. For Gmail use `smtp.gmail.com`, port `465`, and an
+Click **Email: off** in the header and enter SMTP details. For Gmail use `smtp.gmail.com`, port `465`, and an
 [App Password](https://support.google.com/accounts/answer/185833).
 
 ## Accounts and cloud sync (optional, Firebase)

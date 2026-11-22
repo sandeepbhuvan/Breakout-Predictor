@@ -1557,6 +1557,7 @@ class App(tk.Tk):
                     raise CloudError("Saved sign-in not found. Sign in again.")
             self._cloud_task(resume, "restored")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.bind("<F1>", lambda e: self.open_help())
 
     # ------------------------------------------------------------------ styling
     def _style(self):
@@ -1655,6 +1656,8 @@ class App(tk.Tk):
         ttk.Label(titles, text=f"Nifty 500  ·  setups likely to close above their 20-day high within "
                                f"{HORIZON} sessions  ·  Upstox live", style="Sub.TLabel").pack(anchor="w")
 
+        self.help_btn = ttk.Button(header, text="?", style="Ghost.TButton", width=2, command=self.open_help)
+        self.help_btn.pack(side="right", padx=(10, 0))
         self.pill = tk.Frame(header, bg=P["surface2"], padx=14, pady=7)
         self.pill.pack(side="right")
         self.email_hint = ttk.Button(header, style="Ghost.TButton", command=self.open_email_dialog)
@@ -2141,6 +2144,115 @@ class App(tk.Tk):
         ttk.Button(row, text="Send test email", style="Ghost.TButton", command=self.test_email).pack(side="left")
         ttk.Button(row, text="Save", style="Accent.TButton", command=save).pack(side="right")
         win.grab_set()
+
+    # ------------------------------------------------------------------ help
+    HELP_DIR = Path(__file__).resolve().parent / "docs" / "images"
+    HELP = [
+        ("h1", "How to use Breakout Predictor"),
+        ("p", "The app watches the Nifty 500 and lists stocks that look ready to close above their 20-day high "
+              f"within {HORIZON} trading sessions. When one of them breaks out and then retests the old high, it "
+              "gives you a buy-in price, a stop and a target, and keeps score of how its calls turned out."),
+        ("img", "overview.png"),
+        ("h2", "1.  Paste your Upstox token"),
+        ("p", "Upstox developer console → My Apps → Analytics token (read-only, valid for a year). Paste it under "
+              "Connection. It stays in memory only and is never saved or uploaded."),
+        ("img", "connection.png"),
+        ("h2", "2.  Set your rules"),
+        ("p", "Min setup score: how strict the predictions are (65 is a good start). Max % below 20D high: how close "
+              "to the breakout level a stock must be. Min price: skips penny stocks. Buy-in profit target %: the "
+              "target for buy-ins (10% by default). Tick the 200-week MA box to keep only long-term uptrends."),
+        ("img", "rules.png"),
+        ("h2", "3.  Run it"),
+        ("p", "Start live predictor scans every minute while the market is open (09:15–15:30 IST, Mon–Fri) and "
+              "emails new setups and buy-in signals. Scan now does a single scan without emails, handy for a quick "
+              "look. Run backtest replays the rules over the past year so you can see whether they work. The first "
+              "run of the day downloads about a year of candles, which takes a few minutes."),
+        ("img", "actions.png"),
+        ("h2", "4.  Read the scoreboard"),
+        ("p", "LIKELY BREAKOUTS: setups right now. BUY-IN WIN RATE: share of closed buy-ins that hit the target. "
+              f"TRACKED HIT RATE: share of past predictions that did break out within {HORIZON} sessions. "
+              "BACKTEST LIFT: how many percentage points more often the picks broke out than every stock near its "
+              "20-day high (positive means the score helps)."),
+        ("img", "stats.png"),
+        ("h2", "5.  Live setups"),
+        ("p", "Each row is a predicted breakout. BREAKOUT LEVEL is the 20-day high to beat, DISTANCE is how far below "
+              "it the price is, SCORE is 0–100 and WHY lists what pushed the score up. Highlighted rows are new in "
+              "this scan. When the market is closed it shows a preview for the next session."),
+        ("img", "live.png"),
+        ("h2", "6.  Buy-ins"),
+        ("p", "Predicted stocks that broke out move here: Waiting for retest → Retesting (Buy above ₹X) → In trade → "
+              "Target hit, Stopped out or Expired. APP BUY-IN, STOP and TARGET are the app's plan. Use the filters "
+              "to see active trades, winners, or stocks that never gave an entry."),
+        ("img", "buyins.png"),
+        ("h2", "7.  Record your own trade"),
+        ("p", "Select a row and click ✎ My buy / sell (or double-click it). Enter the price, date and time you "
+              "bought at, and optionally where you sold. MY P&L then sits next to APP P&L. A • means the position "
+              "is still open and is valued at the live price (or the last close)."),
+        ("img", "mytrade.png"),
+        ("h2", "8.  Track record"),
+        ("p", "Every live prediction is graded automatically: a hit is a daily close above the breakout level within "
+              f"{HORIZON} sessions, a miss is anything else. Filter by hits, misses or still open."),
+        ("img", "track.png"),
+        ("h2", "9.  Email alerts and your account"),
+        ("p", "The Email button opens the SMTP settings (for Gmail: smtp.gmail.com, port 465 and an App Password). "
+              "Sign in creates a free account so predictions, buy-ins, your own trades and settings follow you to "
+              "any PC. ? opens this guide (or press F1)."),
+        ("img", "header.png"),
+        ("h2", "10.  Activity log"),
+        ("p", "Shows what the app is doing: downloads, scans, alerts and errors. Copy puts the whole log on the "
+              "clipboard, handy for reporting a problem. Wrap toggles line wrapping."),
+        ("img", "activity.png"),
+        ("h2", "Good to know"),
+        ("p", "•  Leave the app running during market hours for live alerts; otherwise open it once a day and use "
+              "Scan now.\n•  Predictions are probabilities, not certainties. Judge them by the backtest lift and "
+              "your track record.\n•  Brokerage, taxes and slippage aren't included in any P&L. Nothing here is "
+              "investment advice."),
+    ]
+
+    def open_help(self):
+        if getattr(self, "help_win", None) and self.help_win.winfo_exists():
+            self.help_win.deiconify()
+            self.help_win.lift()
+            return
+        win = self.help_win = tk.Toplevel(self)
+        win.title("How to use · Breakout Predictor")
+        win.configure(bg=P["bg"])
+        w = min(int(980 * self.k), int(self.winfo_screenwidth() * 0.9))
+        h = min(int(820 * self.k), int(self.winfo_screenheight() * 0.85))
+        win.geometry(f"{w}x{h}+{self.winfo_rootx() + 40}+{self.winfo_rooty() + 30}")
+        box = tk.Frame(win, bg=P["surface"], highlightthickness=1, highlightbackground=P["border"])
+        box.pack(fill="both", expand=True, padx=16, pady=16)
+        text = tk.Text(box, bg=P["surface"], fg=P["text"], relief="flat", borderwidth=0, highlightthickness=0,
+                       wrap="word", padx=int(26 * self.k), pady=int(18 * self.k), cursor="arrow",
+                       font=(FONT, 10), spacing3=int(4 * self.k))
+        sb = ttk.Scrollbar(box, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        text.pack(side="left", fill="both", expand=True)
+        text.tag_configure("h1", font=(FONT, 18, "bold"), spacing3=int(10 * self.k))
+        text.tag_configure("h2", font=(FONT, 12, "bold"), foreground=P["accent"],
+                           spacing1=int(18 * self.k), spacing3=int(6 * self.k))
+        text.tag_configure("p", foreground=P["text"])
+        text.tag_configure("img", spacing1=int(8 * self.k), spacing3=int(8 * self.k))
+        win.images = []  # keep references, or Tk shows blank images
+        max_w = w - int(120 * self.k)
+        for kind, value in self.HELP:
+            if kind == "img":
+                try:
+                    img = tk.PhotoImage(file=str(self.HELP_DIR / value))
+                except (tk.TclError, OSError):
+                    continue  # screenshots ship in docs/images; the guide still reads fine without them
+                factor = -(-img.width() // max_w)
+                if factor > 1:
+                    img = img.subsample(factor)
+                win.images.append(img)
+                text.image_create("end", image=img)
+                text.insert("end", "\n", "img")
+            else:
+                text.insert("end", value + "\n", kind)
+        text.configure(state="disabled")
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.focus_set()
 
     # ------------------------------------------------------------------ actions
     def _collect(self):
