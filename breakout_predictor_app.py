@@ -2638,11 +2638,8 @@ class App(tk.Tk):
         self._refresh_stats()
 
     def _notify(self, count):
+        # Stay where the user left it: just a chime and a count in the title / taskbar, no stealing focus.
         self.bell()
-        if self.state() == "iconic":
-            self.deiconify()
-        self.attributes("-topmost", True)
-        self.after(1500, lambda: self.attributes("-topmost", False))
         self.title(f"({count} new) {self.TITLE}")
         self.after(10000, lambda: self.title(self.TITLE))
 
