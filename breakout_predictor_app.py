@@ -2363,7 +2363,10 @@ class App(tk.Tk):
         ("img", "activity.png"),
         ("h2", "Good to know"),
         ("p", "•  Leave the app running during market hours for live alerts; otherwise open it once a day and use "
-              "Scan now.\n•  Predictions are probabilities, not certainties. Judge them by the backtest lift and "
+              "Scan now.\n•  Closing the window hides the app in the system tray (by the clock) and the predictor "
+              "keeps running. Click the tray icon to open it; right-click → Exit to quit. Untick \"Keep running in "
+              "tray when closed\" in that menu to make the X quit instead. New setups never pop the window up."
+              "\n•  Predictions are probabilities, not certainties. Judge them by the backtest lift and "
               "your track record.\n•  Brokerage, taxes and slippage aren't included in any P&L. Nothing here is "
               "investment advice."),
     ]

@@ -183,6 +183,11 @@ Or create a desktop shortcut:
 powershell -ExecutionPolicy Bypass -File install_shortcut.ps1
 ```
 
+**Closing the window keeps it running in the system tray** (next to the clock), so live alerts continue. Click the
+tray icon to open the window again; right-click it → **Exit** to quit. Untick **Keep running in tray when closed** in
+that menu to make the X quit instead. Launching the app again while it's in the tray just opens the running copy.
+New setups never pop the window up: you get a chime, `(N new)` in the title, and the email.
+
 Paste your Upstox access token in the app. The read-only **Analytics token** (Upstox developer console → My Apps →
 Analytics) is valid for a year and covers everything this app uses; regular trading-app access tokens expire daily.
 
