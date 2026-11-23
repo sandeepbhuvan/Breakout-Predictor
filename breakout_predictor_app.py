@@ -69,6 +69,7 @@ QUOTE_BATCH = 200             # Upstox allows up to 500 keys per quote call
 HISTORY_REQ_PER_SEC = 6       # stays under Upstox's 500 requests/minute limit
 
 DEFAULT_CONFIG = {
+    "close_to_tray": True,
     "min_score": 65,
     "max_dist_pct": 3.0,
     "min_price": 20.0,
@@ -1500,6 +1501,156 @@ P = {"bg": "#0d1117", "surface": "#161b26", "surface2": "#1f2635", "border": "#2
 FONT = "Segoe UI"
 
 
+TRAY_CLASS = "BreakoutPredictorTray"
+
+
+class Tray(threading.Thread):
+    """Windows notification-area (system tray) icon with an Open / Close-to-tray / Exit menu.
+
+    Runs its own Win32 message loop on a daemon thread and reports clicks through on_event("open" | "exit" |
+    "toggle"), which the app reads on the Tk thread. Plain ctypes, no extra packages.
+    """
+    WM_TRAY = 0x0400 + 20
+    CMD_OPEN, CMD_TOGGLE, CMD_EXIT = 1, 2, 3
+
+    def __init__(self, icon_path, tooltip, on_event, is_checked):
+        super().__init__(daemon=True)
+        self.icon_path, self.tooltip, self.on_event, self.is_checked = str(icon_path), tooltip, on_event, is_checked
+        self.hwnd = None
+        self.ready = threading.Event()
+        self.ok = False
+
+    # ---- Win32 plumbing
+    def _api(self):
+        import ctypes
+        from ctypes import wintypes as wt
+        u, s, k = ctypes.windll.user32, ctypes.windll.shell32, ctypes.windll.kernel32
+        LRESULT = ctypes.c_ssize_t
+        self.WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [("style", wt.UINT), ("lpfnWndProc", self.WNDPROC), ("cbClsExtra", ctypes.c_int),
+                        ("cbWndExtra", ctypes.c_int), ("hInstance", wt.HINSTANCE), ("hIcon", wt.HICON),
+                        ("hCursor", wt.HANDLE), ("hbrBackground", wt.HBRUSH), ("lpszMenuName", wt.LPCWSTR),
+                        ("lpszClassName", wt.LPCWSTR)]
+
+        class NOTIFYICONDATAW(ctypes.Structure):
+            _fields_ = [("cbSize", wt.DWORD), ("hWnd", wt.HWND), ("uID", wt.UINT), ("uFlags", wt.UINT),
+                        ("uCallbackMessage", wt.UINT), ("hIcon", wt.HICON), ("szTip", wt.WCHAR * 128),
+                        ("dwState", wt.DWORD), ("dwStateMask", wt.DWORD), ("szInfo", wt.WCHAR * 256),
+                        ("uVersion", wt.UINT), ("szInfoTitle", wt.WCHAR * 64), ("dwInfoFlags", wt.DWORD),
+                        ("guidItem", ctypes.c_byte * 16), ("hBalloonIcon", wt.HICON)]
+
+        u.DefWindowProcW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+        u.DefWindowProcW.restype = LRESULT
+        u.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD, ctypes.c_int, ctypes.c_int,
+                                      ctypes.c_int, ctypes.c_int, wt.HWND, wt.HMENU, wt.HINSTANCE, wt.LPVOID]
+        u.CreateWindowExW.restype = wt.HWND
+        u.LoadImageW.argtypes = [wt.HINSTANCE, wt.LPCWSTR, wt.UINT, ctypes.c_int, ctypes.c_int, wt.UINT]
+        u.LoadImageW.restype = wt.HANDLE
+        u.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+        u.TrackPopupMenu.argtypes = [wt.HMENU, wt.UINT, ctypes.c_int, ctypes.c_int, ctypes.c_int, wt.HWND, wt.LPVOID]
+        u.AppendMenuW.argtypes = [wt.HMENU, wt.UINT, ctypes.c_size_t, wt.LPCWSTR]
+        u.CreatePopupMenu.restype = wt.HMENU
+        u.DestroyMenu.argtypes = [wt.HMENU]
+        u.SetForegroundWindow.argtypes = [wt.HWND]
+        u.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+        u.GetMessageW.argtypes = [ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT]
+        u.DispatchMessageW.argtypes = [ctypes.POINTER(wt.MSG)]
+        u.TranslateMessage.argtypes = [ctypes.POINTER(wt.MSG)]
+        u.SetMenuDefaultItem.argtypes = [wt.HMENU, wt.UINT, wt.UINT]
+        s.Shell_NotifyIconW.argtypes = [wt.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
+        k.GetModuleHandleW.restype = wt.HMODULE
+        return ctypes, wt, u, s, k, WNDCLASSW, NOTIFYICONDATAW
+
+    def run(self):
+        try:
+            self._run()
+        except Exception:  # noqa: BLE001 - no tray: the app falls back to a normal close
+            self.ok = False
+            self.ready.set()
+
+    def _run(self):
+        ctypes, wt, u, s, k, WNDCLASSW, NOTIFYICONDATAW = self._api()
+        hinst = k.GetModuleHandleW(None)
+        taskbar_created = u.RegisterWindowMessageW("TaskbarCreated")
+
+        def nid(flags):
+            d = NOTIFYICONDATAW()
+            d.cbSize, d.hWnd, d.uID, d.uFlags = ctypes.sizeof(NOTIFYICONDATAW), self.hwnd, 1, flags
+            d.uCallbackMessage, d.hIcon, d.szTip = self.WM_TRAY, self.hicon, self.tooltip[:127]
+            return d
+
+        def add():
+            return s.Shell_NotifyIconW(0, ctypes.byref(nid(0x1 | 0x2 | 0x4)))  # NIM_ADD: message | icon | tip
+
+        def menu():
+            m = u.CreatePopupMenu()
+            u.AppendMenuW(m, 0, self.CMD_OPEN, "Open Breakout Predictor")
+            u.AppendMenuW(m, 0x8 if self.is_checked() else 0, self.CMD_TOGGLE, "Keep running in tray when closed")
+            u.AppendMenuW(m, 0x800, 0, None)  # separator
+            u.AppendMenuW(m, 0, self.CMD_EXIT, "Exit")
+            u.SetMenuDefaultItem(m, self.CMD_OPEN, 0)
+            pt = wt.POINT()
+            u.GetCursorPos(ctypes.byref(pt))
+            u.SetForegroundWindow(self.hwnd)  # lets the menu close when you click elsewhere
+            cmd = u.TrackPopupMenu(m, 0x100 | 0x2, pt.x, pt.y, 0, self.hwnd, None)  # RETURNCMD | RIGHTBUTTON
+            u.PostMessageW(self.hwnd, 0, 0, 0)
+            u.DestroyMenu(m)
+            if cmd:
+                self.on_event({self.CMD_OPEN: "open", self.CMD_TOGGLE: "toggle", self.CMD_EXIT: "exit"}[cmd])
+
+        def proc(hwnd, msg, wparam, lparam):
+            if msg == self.WM_TRAY:
+                if lparam in (0x0202, 0x0203):  # left click / double click
+                    self.on_event("open")
+                elif lparam == 0x0205:  # right button up
+                    menu()
+                return 0
+            if msg == taskbar_created:  # Explorer restarted: put the icon back
+                add()
+                return 0
+            if msg == 0x0002:  # WM_DESTROY
+                s.Shell_NotifyIconW(2, ctypes.byref(nid(0)))  # NIM_DELETE
+                u.PostQuitMessage(0)
+                return 0
+            return u.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        self._proc = self.WNDPROC(proc)  # keep a reference, or Windows calls freed memory
+        wc = WNDCLASSW(lpfnWndProc=self._proc, hInstance=hinst, lpszClassName=TRAY_CLASS)
+        u.RegisterClassW(ctypes.byref(wc))
+        self.hwnd = u.CreateWindowExW(0, TRAY_CLASS, "Breakout Predictor", 0, 0, 0, 0, 0, None, None, hinst, None)
+        self.hicon = u.LoadImageW(None, self.icon_path, 1, 0, 0, 0x10 | 0x40)  # IMAGE_ICON, FROMFILE | DEFAULTSIZE
+        self.ok = bool(self.hwnd) and bool(add())
+        self.ready.set()
+        msg = wt.MSG()
+        while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            u.TranslateMessage(ctypes.byref(msg))
+            u.DispatchMessageW(ctypes.byref(msg))
+
+    # ---- called from the Tk thread
+    def stop(self):
+        if self.hwnd:
+            import ctypes
+            ctypes.windll.user32.PostMessageW(self.hwnd, 0x0010, 0, 0)  # WM_CLOSE -> WM_DESTROY on the tray thread
+
+    @staticmethod
+    def show_running_instance():
+        """If the app is already running (maybe hidden in the tray), open that window and return True."""
+        try:
+            import ctypes
+            u = ctypes.windll.user32
+            u.FindWindowW.restype = ctypes.c_void_p
+            hwnd = u.FindWindowW(TRAY_CLASS, None)
+            if hwnd:
+                u.AllowSetForegroundWindow(-1)
+                u.PostMessageW(ctypes.c_void_p(hwnd), Tray.WM_TRAY, 0, 0x0202)
+                return True
+        except Exception:  # noqa: BLE001 - not Windows
+            pass
+        return False
+
+
 def windows_setup():
     try:
         import ctypes
@@ -1558,6 +1709,14 @@ class App(tk.Tk):
             self._cloud_task(resume, "restored")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind("<F1>", lambda e: self.open_help())
+        self.tray = None
+        self.tray_hint_shown = False
+        if os.name == "nt":
+            tray = Tray(icon, self.TITLE, lambda what: self.events.put(("tray", what)),
+                        lambda: bool(self.cfg.get("close_to_tray", True)))
+            tray.start()
+            if tray.ready.wait(3) and tray.ok:
+                self.tray = tray
 
     # ------------------------------------------------------------------ styling
     def _style(self):
@@ -2557,6 +2716,18 @@ class App(tk.Tk):
                     self._refresh_buyins()
                 elif kind == "notify":
                     self._notify(ev[1])
+                elif kind == "tray":
+                    if ev[1] == "open":
+                        self._show_window()
+                    elif ev[1] == "exit":
+                        self._quit()
+                        return
+                    elif ev[1] == "toggle":
+                        self.cfg["close_to_tray"] = not self.cfg.get("close_to_tray", True)
+                        save_config(self.cfg)
+                        self._log("Close button " + ("now hides the app in the tray (right-click the tray icon → "
+                                                     "Exit to quit)." if self.cfg["close_to_tray"]
+                                                     else "now quits the app."))
                 elif kind == "auth_error":
                     self._set_pill("error")
                     messagebox.showerror("Upstox token", ev[1] + "\nPaste a fresh token and start again.")
@@ -2644,8 +2815,29 @@ class App(tk.Tk):
         self.after(10000, lambda: self.title(self.TITLE))
 
     def _on_close(self):
+        """The window's X: hide in the tray (the predictor keeps running) or quit, depending on the tray setting."""
+        if self.tray and self.cfg.get("close_to_tray", True):
+            self.withdraw()
+            if not self.tray_hint_shown:
+                self.tray_hint_shown = True
+                self._log("Still running in the system tray. Click the tray icon to open; right-click → Exit to quit.")
+            return
+        self._quit()
+
+    def _show_window(self):
+        """Bring the window back, only ever because the user asked (tray click or launching the app again)."""
+        self.deiconify()
+        self.state("normal")
+        self.lift()
+        self.attributes("-topmost", True)
+        self.after(300, lambda: self.attributes("-topmost", False))
+        self.focus_force()
+
+    def _quit(self):
         if self.engine and self.engine.is_alive():
             self.engine.stop()
+        if self.tray:
+            self.tray.stop()
         self.destroy()
 
 
@@ -2653,6 +2845,8 @@ if __name__ == "__main__":
     import sys
     if len(sys.argv) == 3 and sys.argv[1] == "--make-icon":
         write_icon(sys.argv[2])
+    elif Tray.show_running_instance():
+        pass  # already running (perhaps hidden in the tray): that window was opened instead
     else:
         try:
             app = App()
