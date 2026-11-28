@@ -86,6 +86,13 @@ valued at the live price (or the last close).
 
 <img src="docs/images/mytrade.png" width="520" alt="My trade dialog">
 
+### Charts
+
+Select a row in any table and click **📈 TradingView** (or press **Ctrl+T**). The stock's TradingView Supercharts
+opens in a window over the app: an Edge app window, with no tabs or address bar. Right-click a row for more: the
+chart in your normal browser (useful if you're signed in to TradingView there), News, My buy / sell, or Copy symbol.
+TradingView can't be drawn inside the app's own window, because Tkinter has no web engine.
+
 ### 8. Track record
 
 Every live prediction is graded automatically. A **hit** is a daily close above the breakout level within 7 sessions;

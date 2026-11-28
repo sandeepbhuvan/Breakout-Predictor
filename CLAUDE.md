@@ -118,6 +118,9 @@ Changing the scoring changes all three.
 - `Tray` puts a notification-area icon on its own Win32 message loop. With `close_to_tray`, the window's X hides the
   app; tray → Exit quits. A second launch finds the running copy through the tray window class and opens it.
 - New setups must never raise or focus the window: `_notify` only chimes and updates the title.
+- 📈 TradingView / Ctrl+T / the right-click menu (`_row_menu`) open `tradingview_url` in an Edge `--app` window
+  (`tradingview_command`, sizes in DIPs, so divide Tk's pixels by `self.k`), else the default browser.
+  TradingView writes NSE '-' as '_' and keeps '&'.
 
 ## Workflow notes
 

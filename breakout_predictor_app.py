@@ -34,7 +34,9 @@ import json
 import os
 import queue
 import re
+import shutil
 import smtplib
+import subprocess
 import ssl
 import threading
 import time
@@ -2015,6 +2017,27 @@ def load_secret(name):
         return ""
 
 
+# =========================================================================== TradingView
+def tradingview_url(symbol):
+    """Supercharts for an NSE symbol. TradingView writes '-' as '_' (BAJAJ-AUTO -> BAJAJ_AUTO) and keeps '&'."""
+    return "https://www.tradingview.com/chart/?" + urllib.parse.urlencode({"symbol": f"NSE:{symbol.replace('-', '_')}"})
+
+
+def find_edge():
+    for path in (shutil.which("msedge"),
+                 os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
+                 os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe")):
+        if path and os.path.exists(path):
+            return path
+    return None
+
+
+def tradingview_command(symbol, edge, geometry):
+    """Edge 'app' window (no tabs or address bar) over the app: (x, y, w, h) in screen pixels."""
+    x, y, w, h = geometry
+    return [edge, f"--app={tradingview_url(symbol)}", f"--window-size={w},{h}", f"--window-position={x},{y}"]
+
+
 def windows_setup():
     try:
         import ctypes
@@ -2077,6 +2100,9 @@ class App(tk.Tk):
             self._cloud_task(resume, "restored")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind("<F1>", lambda e: self.open_help())
+        self.bind("<Control-t>", lambda e: self.open_tradingview())
+        for tree in (self.tree, self.buyins, self.track):
+            tree.bind("<Button-3>", lambda e, t=tree: self._row_menu(e, t))
         self.tray = None
         self.tray_hint_shown = False
         if os.name == "nt":
@@ -2275,6 +2301,9 @@ class App(tk.Tk):
             self.tab_btns[name] = ttk.Button(head, text=text, style="Seg.TButton", width=-4,
                                              command=lambda n=name: self._show_tab(n))
             self.tab_btns[name].pack(side="left", padx=(0, 6))
+        self.chart_btn = ttk.Button(head, text="📈  TradingView", style="Ghost.TButton",
+                                    command=lambda: self.open_tradingview())
+        self.chart_btn.pack(side="right", padx=(12, 0))
         self.tab_hint = ttk.Label(head, style="Hint.TLabel")
         self.tab_hint.pack(side="right")
 
@@ -2820,6 +2849,56 @@ class App(tk.Tk):
         ttk.Button(row, text="Save", style="Accent.TButton", command=save).pack(side="right")
         win.grab_set()
 
+    # ------------------------------------------------------------------ TradingView + row menu
+    def _selected_symbol(self):
+        for tree in (self.tree, self.buyins, self.track):
+            if tree.winfo_ismapped() and tree.selection():
+                return tree.set(tree.selection()[0], "symbol")
+        return None
+
+    def open_tradingview(self, symbol=None, browser=False):
+        """Supercharts for the selected row: in an Edge app window over this one, or the default browser."""
+        symbol = symbol or self._selected_symbol()
+        if not symbol:
+            messagebox.showinfo("TradingView", "Select a stock in the table first (or right-click it).")
+            return
+        url = tradingview_url(symbol)
+        edge = None if browser else find_edge()
+        if edge:
+            # Edge takes window size/position in device-independent pixels; Tk reports physical ones.
+            x, y = int(self.winfo_rootx() / self.k) + 40, int(self.winfo_rooty() / self.k) + 20
+            w, h = max(900, int(self.winfo_width() / self.k) - 80), max(600, int(self.winfo_height() / self.k) - 60)
+            try:
+                subprocess.Popen(tradingview_command(symbol, edge, (x, y, w, h)), close_fds=True)
+                self._log(f"TradingView: {symbol}")
+                return
+            except OSError:
+                pass  # fall back to the default browser
+        webbrowser.open(url)
+        self._log(f"TradingView: {symbol} (browser)")
+
+    def _row_menu(self, event, tree):
+        iid = tree.identify_row(event.y)
+        if not iid:
+            return
+        tree.selection_set(iid)
+        tree.focus(iid)
+        symbol = tree.set(iid, "symbol")
+        menu = tk.Menu(self, tearoff=0, bg=P["surface2"], fg=P["text"], activebackground=P["selected"],
+                       activeforeground=P["text"], bd=0, font=(FONT, 10))
+        menu.add_command(label=f"📈  {symbol} on TradingView", command=lambda: self.open_tradingview(symbol))
+        menu.add_command(label="     … in my browser", command=lambda: self.open_tradingview(symbol, browser=True))
+        if tree is self.tree:
+            menu.add_command(label="📰  News", command=self.open_news_window)
+        if tree is self.buyins:
+            menu.add_command(label="✎  My buy / sell", command=self.open_my_trade_dialog)
+        menu.add_separator()
+        menu.add_command(label="Copy symbol", command=lambda: (self.clipboard_clear(), self.clipboard_append(symbol)))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
     def open_news_window(self):
         sel = self.tree.selection()
         if not sel:
@@ -2993,6 +3072,10 @@ class App(tk.Tk):
               "bought at, and optionally where you sold. MY P&L then sits next to APP P&L. A • means the position "
               "is still open and is valued at the live price (or the last close)."),
         ("img", "mytrade.png"),
+        ("h2", "Charts (any table)"),
+        ("p", "Select a row in any table and click 📈 TradingView (or press Ctrl+T) to open its TradingView "
+              "Supercharts in a window over the app. Right-click a row for more: the chart in your normal browser "
+              "(where you may be signed in to TradingView), News, My buy / sell, or copy the symbol."),
         ("h2", "8.  Track record"),
         ("p", "Every live prediction is graded automatically: a hit is a daily close above the breakout level within "
               f"{HORIZON} sessions, a miss is anything else. Filter by hits, misses or still open."),
