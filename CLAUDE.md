@@ -83,7 +83,8 @@ Changing the scoring changes all three.
 **News sentiment.**
 - `NewsDesk` (used by `Engine.scan_once` when the app sets `engine.news`) fetches Google News RSS (`google_news`).
   It keeps headlines that name the company (`mentions`), then makes one `gemini_json_any` call per sector (key in
-  the `x-goog-api-key` header). The model is `auto` by default: `GEMINI_AUTO_MODELS`, best free model first.
+  the `x-goog-api-key` header). The model is `auto` by default: `GEMINI_AUTO_MODELS`, best free model first. Free-tier 503s are common, so a busy model
+  is skipped for `GEMINI_BUSY_COOLDOWN` and an unavailable one for the day (`NewsDesk._skip`).
 - Results are cached in `APP_DIR/news_DATE.json`.
 - The rows get `news` (the combined score), the optional `news_filter` drops rows at or below `NEG_NEWS`, and
   predictions store `news`.

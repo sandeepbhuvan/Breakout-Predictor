@@ -1202,18 +1202,27 @@ def gemini_models(setting):
     return list(GEMINI_AUTO_MODELS) if setting.lower() in ("", "auto") else [setting]
 
 
-def gemini_json_any(api_key, models, prompt, timeout=90):
-    """gemini_json over a list of models: returns (result, model used). A model the key can't use (not found,
-    not allowed, out of free quota) quickly falls through to the next; the last one gets the full retries."""
+GEMINI_BUSY_COOLDOWN = 20 * 60  # seconds to skip a model after "high demand" / timeouts before trying it again
+
+
+def gemini_json_any(api_key, models, prompt, timeout=90, on_fail=None):
+    """gemini_json over a list of models, best first: returns (result, model used).
+
+    Free-tier calls to the bigger models often get 503 "high demand". A model that's busy gets one quick retry
+    with a shorter timeout, then the next model is tried. Not found, not allowed or out of quota falls through
+    at once. The last model gets the full retries. on_fail(model, error) reports each model that was skipped."""
     last = None
     for i, model in enumerate(models):
         final = i == len(models) - 1
         try:
-            return gemini_json(api_key, model, prompt, timeout, retries=3 if final else 0), model
+            return gemini_json(api_key, model, prompt, timeout if final else min(timeout, 30),
+                               retries=3 if final else 1, retry_on=(429, 500, 503) if final else (500, 503)), model
         except GeminiError as e:
             last = e
-            if e.code in (401,) or final:  # a bad key fails the same on every model
+            if e.code == 401 or final:  # a bad key fails the same on every model
                 raise
+            if on_fail:
+                on_fail(model, e)
     raise last
 
 
@@ -1231,7 +1240,7 @@ def google_news(query, days=NEWS_DAYS, limit=NEWS_PER_QUERY):
     return out
 
 
-def gemini_json(api_key, model, prompt, timeout=90, retries=3):
+def gemini_json(api_key, model, prompt, timeout=90, retries=3, retry_on=(429, 500, 503)):
     """Call Gemini generateContent asking for JSON; returns the parsed object. Retries rate limits / overload."""
     body = json.dumps({"contents": [{"role": "user", "parts": [{"text": prompt}]}],
                        "generationConfig": {"responseMimeType": "application/json"}}).encode()
@@ -1245,7 +1254,7 @@ def gemini_json(api_key, model, prompt, timeout=90, retries=3):
             break
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")[:300]
-            if e.code in (429, 500, 503) and attempt < retries:
+            if e.code in retry_on and attempt < retries:
                 time.sleep(5 * 3 ** attempt)  # 5s, 15s, 45s
                 continue
             hint = {400: "bad request (check the model name)", 401: "API key not valid", 403: "API key not allowed",
@@ -1309,7 +1318,15 @@ class NewsDesk:
     def __init__(self, api_key, model, log):
         self.api_key, self.models, self.log = api_key, gemini_models(model), log
         self.model_used = None
+        self.skip_until = {}  # model -> time before which it isn't tried (busy: minutes; unavailable: the day)
         self.failed_on = None  # date Gemini failed (bad key, quota): stop retrying that day, don't block setups
+
+    def _skip(self, model, err):
+        """Remember a model that failed: busy or slow -> retry it in 20 minutes; unavailable or out of quota -> today."""
+        busy = err.code in (500, 503) or err.code is None
+        self.skip_until[model] = time.time() + (GEMINI_BUSY_COOLDOWN if busy else 24 * 3600)
+        self.log(f"News: {model} {'is busy' if busy else 'is unavailable'} "
+                 f"({err.code or 'timeout'}); {'retrying it in 20 min' if busy else 'skipping it today'}")
 
     @staticmethod
     def path():
@@ -1346,11 +1363,13 @@ class NewsDesk:
                 news = [h for h in news if mentions(h["title"], sym, company)][:NEWS_PER_QUERY]
                 stocks.append((sym, company or sym, news))
             try:
-                out, model = gemini_json_any(self.api_key, self.models, sentiment_prompt(industry, sector_news, stocks))
+                now = time.time()
+                models = [m for m in self.models if self.skip_until.get(m, 0) <= now] or self.models[-1:]
+                out, model = gemini_json_any(self.api_key, models, sentiment_prompt(industry, sector_news, stocks),
+                                             on_fail=self._skip)
                 if model != self.model_used:
                     self.model_used = model
                     self.log(f"News: using {model}")
-                    self.models = self.models[self.models.index(model):]  # don't retry worse-off models today
             except GeminiError as e:
                 self.failed_on = today_str()
                 self.log(f"News sentiment paused for today: {e}")

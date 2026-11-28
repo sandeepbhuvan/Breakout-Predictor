@@ -119,7 +119,9 @@ Then tick **Analyse news for setups**.
   the free tier is plenty.
 - **Model:** *auto* (the default) tries the best free model first, `gemini-4-hydrogen`, then `gemini-3.8-flash`,
   then `gemini-3.5-flash-lite`. It uses the first one your key is allowed and has quota for, and the log says which.
-  You can type a specific model name instead.
+  On the free tier the bigger models are often busy ("high demand"). A busy model gets one quick retry, then the
+  next model is used, and the busy one is tried again 20 minutes later. A model that's unavailable or out of quota
+  is skipped for the day. You can type a specific model name instead.
 - **The key:** tick *Remember the key on this PC* (on by default) and you paste it once. It's saved in
   `~/.breakout_predictor/gemini.key`, encrypted with Windows DPAPI, so only your Windows account on this PC can read
   it. It's never synced. Untick the box and Save to forget it. The `GEMINI_API_KEY` environment variable also works.
