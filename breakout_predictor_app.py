@@ -33,6 +33,7 @@ import io
 import json
 import os
 import queue
+import re
 import smtplib
 import ssl
 import threading
@@ -81,6 +82,8 @@ DEFAULT_CONFIG = {
     "max_emails_per_day": 20,
     "wma200_filter": False,
     "target_pct": 10.0,
+    "pnl_mode": "pct",
+    "trade_amount": 100000,
 }
 WEEKLY_CALENDAR_DAYS = 1950   # ~5.3 years: 200 completed weeks before every backtest day
 WMA_WEEKS = 200
@@ -723,6 +726,14 @@ def my_pnl(t, price_now):
     if t.get("my_sell_price"):
         return pct(t["my_buy_price"], t["my_sell_price"]), True
     return (pct(t["my_buy_price"], price_now), False) if price_now else (None, False)
+
+
+def pnl_amount(pct_value, entry, amount):
+    """Rupee P&L of putting `amount` into whole shares at `entry` and moving pct_value %. None if unknown."""
+    if pct_value is None or not entry or not amount:
+        return None
+    qty = int(amount // entry)
+    return qty * entry * pct_value / 100 if qty else None
 
 
 def build_trades(preds, history, existing, target_pct):
@@ -1915,7 +1926,7 @@ class App(tk.Tk):
         tbl = self.tabs["live"]
         self.tree = ttk.Treeview(tbl, columns=[col[0] for col in self.COLUMNS], show="headings", selectmode="browse")
         for key, title, width, anchor in self.COLUMNS:
-            self.tree.heading(key, text=title, anchor=anchor)
+            self.tree.heading(key, text=title, anchor=anchor, command=lambda k=key: self._sort_click(self.tree, k))
             self.tree.column(key, width=int(width * self.k), anchor=anchor, stretch=key in ("why", "industry"))
         self.tree.tag_configure("alt", background=P["row_alt"])
         self.tree.tag_configure("new", background=P["new_row"])
@@ -1973,11 +1984,14 @@ class App(tk.Tk):
         box.pack(fill="both", expand=True)
         self.track = ttk.Treeview(box, columns=[col[0] for col in self.TRACK_COLUMNS], show="headings", selectmode="browse")
         for key, title, width, anchor in self.TRACK_COLUMNS:
-            self.track.heading(key, text=title, anchor=anchor)
+            self.track.heading(key, text=title, anchor=anchor,
+                               command=lambda k=key: self._sort_click(self.track, k))
             self.track.column(key, width=int(width * self.k), anchor=anchor, stretch=key == "symbol")
         self.track.tag_configure("hit", foreground=P["green"])
         self.track.tag_configure("miss", foreground=P["red"])
         self.track.tag_configure("open", foreground=P["muted"])
+        self.track.tag_configure("pos", foreground=P["green"])
+        self.track.tag_configure("neg", foreground=P["red"])
         sb = ttk.Scrollbar(box, orient="vertical", command=self.track.yview)
         self.track.configure(yscrollcommand=sb.set)
         self.track.pack(side="left", fill="both", expand=True)
@@ -2004,22 +2018,40 @@ class App(tk.Tk):
             self.buyin_btns[name] = ttk.Button(bar, text=text, style="Seg.TButton", width=-4,
                                                command=lambda n=name: self._set_buyin_filter(n))
             self.buyin_btns[name].pack(side="left", padx=(0, 6))
-        self.buyin_summary = ttk.Label(bar, style="Hint.TLabel")
-        self.buyin_summary.pack(side="right")
+        # The summary sits in the tab header row (where the other tabs show their hint) to leave room here.
+        self.buyin_summary = ttk.Label(self.tab_hint.master, style="Hint.TLabel")
         ttk.Button(bar, text="✎  My buy / sell", style="Ghost.TButton",
-                   command=self.open_my_trade_dialog).pack(side="right", padx=(0, 12))
+                   command=self.open_my_trade_dialog).pack(side="right")
+        self.pnl_mode = self.cfg.get("pnl_mode", "pct")
+        self.amount_var = tk.StringVar(value=f"{float(self.cfg.get('trade_amount') or 100000):,.0f}")
+        self.amount_entry = ttk.Entry(bar, textvariable=self.amount_var, width=10, justify="right")
+        self.amount_entry.pack(side="right", padx=(0, 16))
+        self.amount_entry.bind("<Return>", lambda e: self._set_trade_amount())
+        self.amount_entry.bind("<FocusOut>", lambda e: self._set_trade_amount())
+        self.amount_label = ttk.Label(bar, text="per trade ₹", style="Hint.TLabel")
+        self.amount_label.pack(side="right", padx=(0, 6))
+        self.pnl_btns = {}
+        for name, text in [("amt", "₹"), ("pct", "%")]:
+            self.pnl_btns[name] = ttk.Button(bar, text=text, style="Seg.TButton", width=3,
+                                             command=lambda n=name: self._set_pnl_mode(n))
+            self.pnl_btns[name].pack(side="right", padx=(0, 4))
+        ttk.Label(bar, text="P&L in", style="Hint.TLabel").pack(side="right", padx=(0, 6))
         box = ttk.Frame(parent, style="Card.TFrame")
         box.pack(fill="both", expand=True)
         self.buyins = ttk.Treeview(box, columns=[col[0] for col in self.BUYIN_COLUMNS], show="headings",
                                    selectmode="browse")
         for key, title, width, anchor in self.BUYIN_COLUMNS:
-            self.buyins.heading(key, text=title, anchor=anchor)
+            self.buyins.heading(key, text=title, anchor=anchor,
+                                command=lambda k=key: self._sort_click(self.buyins, k))
             self.buyins.column(key, width=int(width * self.k), anchor=anchor, stretch=key == "status")
         for tag, color in [("win", P["green"]), ("loss", P["red"]), ("expired", P["amber"]), ("entered", P["accent"]),
                            ("retesting", P["amber"]), ("waiting_retest", P["text"])]:
             self.buyins.tag_configure(tag, foreground=color)
         for tag in ("failed", "no_retest", "no_entry"):
             self.buyins.tag_configure(tag, foreground=P["muted"])
+        # Rows with a P&L are coloured by its sign instead (Tk can't colour single cells).
+        self.buyins.tag_configure("pos", foreground=P["green"])
+        self.buyins.tag_configure("neg", foreground=P["red"])
         sb = ttk.Scrollbar(box, orient="vertical", command=self.buyins.yview)
         self.buyins.configure(yscrollcommand=sb.set)
         self.buyins.pack(side="left", fill="both", expand=True)
@@ -2030,6 +2062,83 @@ class App(tk.Tk):
                                          "then moves to Retesting\nand In trade once it bounces above the "
                                          "retest day's high.")
         self._set_buyin_filter("all")
+
+    def _set_pnl_mode(self, mode):
+        self.pnl_mode = self.cfg["pnl_mode"] = mode
+        save_config(self.cfg)
+        self._refresh_buyins()
+
+    def _set_trade_amount(self):
+        try:
+            amount = float(self.amount_var.get().replace(",", "").replace("₹", "").strip())
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            amount = float(self.cfg.get("trade_amount") or 100000)
+        self.amount_var.set(f"{amount:,.0f}")
+        if amount != self.cfg.get("trade_amount"):
+            self.cfg["trade_amount"] = amount
+            save_config(self.cfg)
+            self._refresh_buyins()
+
+    # ------------------------------------------------------------------ column sorting
+    TEXT_COLUMNS = {"symbol", "industry", "why", "status"}  # first click sorts these A→Z, the rest high→low
+
+    def _columns_of(self, tree):
+        for name, cols in (("tree", self.COLUMNS), ("buyins", self.BUYIN_COLUMNS), ("track", self.TRACK_COLUMNS)):
+            if getattr(self, name, None) is tree:
+                return cols
+        return []
+
+    def _sort_click(self, tree, col):
+        if not hasattr(self, "sort_state"):
+            self.sort_state = {}
+        cur = self.sort_state.get(str(tree))
+        desc = (not cur[1]) if cur and cur[0] == col else col not in self.TEXT_COLUMNS
+        self.sort_state[str(tree)] = (col, desc)
+        self._apply_sort(tree)
+
+    @staticmethod
+    def _sort_value(text):
+        """Sort key from a cell's display text: dates, then numbers (₹, %, commas, • ignored), then text."""
+        s = str(text).strip()
+        if s in ("", "—", "-"):
+            return None
+        if s == "new":  # live 'PREDICTED' column: predicted this scan
+            return (0, float("inf"))
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                return (0, datetime.strptime(s, fmt).timestamp())
+            except ValueError:
+                pass
+        try:
+            d = datetime.strptime(f"{now_ist().year} {s}", "%Y %b %d")
+            return (0, d.timestamp())
+        except ValueError:
+            pass
+        m = re.match(r"^([+\-−]?)₹?([\d,]+(?:\.\d+)?)", s)
+        if m:
+            value = float(m.group(2).replace(",", ""))
+            return (0, -value if m.group(1) in ("-", "−") else value)
+        return (1, s.lower())
+
+    def _apply_sort(self, tree):
+        state = getattr(self, "sort_state", {}).get(str(tree))
+        for key, title, _, _ in self._columns_of(tree):
+            arrow = ("  ▼" if state[1] else "  ▲") if state and state[0] == key else ""
+            tree.heading(key, text=title + arrow)
+        if not state:
+            return
+        col, desc = state
+        keyed = [(self._sort_value(tree.set(iid, col)), iid) for iid in tree.get_children("")]
+        present = sorted([k for k in keyed if k[0] is not None], key=lambda k: k[0], reverse=desc)
+        missing = [k for k in keyed if k[0] is None]  # blanks always go last
+        for i, (_, iid) in enumerate(present + missing):
+            tree.move(iid, "", i)
+        if tree is self.tree:  # re-stripe the live table, keeping 'new' highlights
+            for i, iid in enumerate(tree.get_children("")):
+                if "new" not in tree.item(iid, "tags"):
+                    tree.item(iid, tags=("alt",) if i % 2 else ())
 
     def _set_buyin_filter(self, name):
         self.buyin_filter = name
@@ -2043,21 +2152,51 @@ class App(tk.Tk):
     def _refresh_buyins(self):
         trades = load_trades()
         ts = trade_summary(trades)
+        amount = float(self.cfg.get("trade_amount") or 100000)
+        in_rupees = self.pnl_mode == "amt"
+        for n, b in self.pnl_btns.items():
+            b.configure(style="SegOn.TButton" if n == self.pnl_mode else "Seg.TButton")
+        self.amount_entry.configure(state="normal" if in_rupees else "disabled")
         active = sum(1 for t in trades if t.get("status") in self.BUYIN_FILTERS["active"])
-        mine = [p for p in (my_pnl(t, self._price_now(t))[0] for t in trades) if p is not None]
-        self.buyin_summary.configure(
-            text=f"{active} active  ·  {ts['closed']} closed"
-                 + (f"  ·  app avg {ts['avg']:+.1f}%" if ts["closed"] else "")
-                 + (f"  ·  my trades {len(mine)}, avg {sum(mine) / len(mine):+.1f}%" if mine else ""))
+        rupees = lambda v: ("+" if v >= 0 else "−") + f"₹{abs(v):,.0f}"  # noqa: E731
+        if in_rupees:
+            booked = opened = mine_total = 0.0
+            n_mine = 0
+            for t in trades:
+                val, realised = app_pnl(t, self._price_now(t))
+                amt = pnl_amount(val, t.get("entry_price"), amount)
+                if amt is not None:
+                    if realised:
+                        booked += amt
+                    else:
+                        opened += amt
+                mine_amt = pnl_amount(my_pnl(t, self._price_now(t))[0], t.get("my_buy_price"), amount)
+                if mine_amt is not None:
+                    mine_total += mine_amt
+                    n_mine += 1
+            summary = (f"{active} active  ·  {ts['closed']} closed  ·  app "
+                       + (f"{rupees(booked)} booked" if ts["closed"] else "nothing booked yet")
+                       + f", {rupees(opened)} open" + (f"  ·  mine {rupees(mine_total)}" if n_mine else ""))
+        else:
+            mine = [p for p in (my_pnl(t, self._price_now(t))[0] for t in trades) if p is not None]
+            summary = (f"{active} active  ·  {ts['closed']} closed"
+                       + (f"  ·  app avg {ts['avg']:+.1f}%" if ts["closed"] else "")
+                       + (f"  ·  my trades {len(mine)}, avg {sum(mine) / len(mine):+.1f}%" if mine else ""))
+        self.buyin_summary.configure(text=summary)
         self.buyins.delete(*self.buyins.get_children())
         allowed = self.BUYIN_FILTERS[self.buyin_filter]
         shown = [t for t in trades if allowed is None or t.get("status") in allowed]
         shown.sort(key=lambda t: t.get("breakout_date", ""), reverse=True)
         money = lambda v: f"₹{v:,.2f}" if v else "—"  # noqa: E731
 
-        def pnl_text(p):
+        def pnl_text(p, entry):
             val, realised = p
-            return "—" if val is None else f"{val:+.2f}%" + ("" if realised else " •")
+            if in_rupees:
+                val = pnl_amount(val, entry, amount)
+                text = None if val is None else rupees(val)
+            else:
+                text = None if val is None else f"{val:+.2f}%"
+            return "—" if text is None else text + ("" if realised else " •")
 
         for t in shown:
             st = t.get("status")
@@ -2072,10 +2211,14 @@ class App(tk.Tk):
             if t.get("my_buy_price"):
                 my_buy = f"{money(t['my_buy_price'])} · {str(t.get('my_buy_time', ''))[5:10]}"
             price_now = self._price_now(t)
-            self.buyins.insert("", "end", iid=t["id"], tags=(st,), values=(
+            app_val = app_pnl(t, price_now)[0]
+            sign = app_val if app_val is not None else my_pnl(t, price_now)[0]
+            tag = st if sign is None or sign == 0 else ("pos" if sign > 0 else "neg")
+            self.buyins.insert("", "end", iid=t["id"], tags=(tag,), values=(
                 t.get("breakout_date", "—"), t["symbol"], money(t.get("R")), entry, money(t.get("stop")),
-                money(t.get("target")), label, pnl_text(app_pnl(t, price_now)), my_buy,
-                pnl_text(my_pnl(t, price_now))))
+                money(t.get("target")), label, pnl_text(app_pnl(t, price_now), t.get("entry_price")), my_buy,
+                pnl_text(my_pnl(t, price_now), t.get("my_buy_price"))))
+        self._apply_sort(self.buyins)
         if shown:
             self.buyin_empty.place_forget()
         else:
@@ -2179,6 +2322,12 @@ class App(tk.Tk):
             frame.pack_forget()
             self.tab_btns[n].configure(style="SegOn.TButton" if n == name else "Seg.TButton")
         self.tabs[name].pack(fill="both", expand=True)
+        if name == "buyins":
+            self.tab_hint.pack_forget()
+            self.buyin_summary.pack(side="right")
+        else:
+            self.buyin_summary.pack_forget()
+            self.tab_hint.pack(side="right")
         self.tab_hint.configure(text={
             "live": "highlighted rows are new  ·  sorted by score",
             "buyins": "predicted breakout → retest → buy above the retest day's high  ·  stop 1% under "
@@ -2206,14 +2355,17 @@ class App(tk.Tk):
         shown.sort(key=lambda p: (p["date"], p.get("time", "")), reverse=True)
         label = {"hit": "✓ Hit", "miss": "✗ Missed", "open": "• Open"}
         for p in shown:
-            move = "—"
+            move, tag = "—", p["status"]
             if p.get("resolved_close") and p.get("price"):
-                move = f"{(p['resolved_close'] - p['price']) / p['price'] * 100:+.2f}%"
-            self.track.insert("", "end", tags=(p["status"],), values=(
+                change = (p["resolved_close"] - p["price"]) / p["price"] * 100
+                move = f"{change:+.2f}%"
+                tag = "pos" if change > 0 else "neg" if change < 0 else tag  # colour by the move's sign
+            self.track.insert("", "end", tags=(tag,), values=(
                 f"{p['date']} {p.get('time', '')}".strip(), p["symbol"], f"{p.get('score', 0):.0f}",
                 f"₹{p['price']:,.2f}" if p.get("price") else "—", f"₹{p['R']:,.2f}",
                 label.get(p["status"], p["status"]), p.get("resolved", "—"),
                 str(p["sessions"]) if p.get("sessions") else "—", move))
+        self._apply_sort(self.track)
         if shown:
             self.track_empty.place_forget()
         else:
@@ -2264,7 +2416,8 @@ class App(tk.Tk):
             self._refresh_buyins()
         self.stat["hit"][0].configure(text=f"{hit / (hit + miss) * 100:.0f}%" if hit + miss else "—",
                                       foreground=P["text"])
-        self.stat["hit"][1].configure(text=f"{hit} hit  ·  {miss} missed" if hit + miss else "graded after 7 sessions")
+        self.stat["hit"][1].configure(text=(f"{hit} hit  ·  {miss} missed  ·  {opened} pending" if hit + miss
+                                            else f"graded after {HORIZON} sessions"))
         if hasattr(self, "track"):
             self._refresh_track()
         bt = read_json(APP_DIR / "backtest.json")
@@ -2336,12 +2489,15 @@ class App(tk.Tk):
         ("h2", "5.  Live setups"),
         ("p", "Each row is a predicted breakout. BREAKOUT LEVEL is the 20-day high to beat, DISTANCE is how far below "
               "it the price is, SCORE is 0–100 and WHY lists what pushed the score up. Highlighted rows are new in "
-              "this scan. When the market is closed it shows a preview for the next session."),
+              "this scan. When the market is closed it shows a preview for the next session. Click any column heading "
+              "to sort by it (click again to reverse); this works in all three tables."),
         ("img", "live.png"),
         ("h2", "6.  Buy-ins"),
         ("p", "Predicted stocks that broke out move here: Waiting for retest → Retesting (Buy above ₹X) → In trade → "
               "Target hit, Stopped out or Expired. APP BUY-IN, STOP and TARGET are the app's plan. Use the filters "
-              "to see active trades, winners, or stocks that never gave an entry."),
+              "to see active trades, winners, or stocks that never gave an entry. P&L in % / ₹ switches the P&L columns "
+              "between percent and rupees; ₹ assumes you put the 'per trade' amount (₹1,00,000 by default) into whole "
+              "shares at each buy price. Rows with a P&L are green when it's up and red when it's down."),
         ("img", "buyins.png"),
         ("h2", "7.  Record your own trade"),
         ("p", "Select a row and click ✎ My buy / sell (or double-click it). Enter the price, date and time you "
@@ -2804,6 +2960,7 @@ class App(tk.Tk):
                 f"{r['score']:.0f}   {bar}", "  ·  ".join(r["reasons"]),
                 open_since.get(r["symbol"], "new")))
         self.row_count = len(rows)
+        self._apply_sort(self.tree)
         if rows:
             self.empty_label.place_forget()
         else:

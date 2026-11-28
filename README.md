@@ -61,6 +61,7 @@ Each row is a predicted breakout:
 - **WHY**: what pushed the score up.
 
 Highlighted rows are new in this scan. When the market is closed, the tab previews the next session.
+Click any column heading to sort by it, and click again to reverse. This works in all three tables.
 
 ![Live setups](docs/images/live.png)
 
@@ -69,6 +70,11 @@ Highlighted rows are new in this scan. When the market is closed, the tab previe
 Predicted stocks that break out move here and are followed through each stage: **Waiting for retest → Buy above ₹X →
 In trade → Target hit / Stopped out / Expired**. **APP BUY-IN**, **STOP** and **TARGET** are the app's plan. The
 filters show active trades, winners, losers or stocks that never gave an entry.
+
+**P&L in % / ₹** switches the P&L columns between percent and rupees. Rupees assume you put the **per trade**
+amount (₹1,00,000 by default) into whole shares at each buy price. The summary above the table then shows the
+app's booked and open profit in rupees. A • marks a position that's still open. Rows with a P&L turn green when it's up and red
+when it's down; in Track record the same goes for the MOVE.
 
 ![Buy-ins](docs/images/buyins.png)
 
