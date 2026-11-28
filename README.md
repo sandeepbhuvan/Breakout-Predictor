@@ -116,8 +116,16 @@ Click **News** in the header and paste a free **Gemini API key** (create it at
 [aistudio.google.com](https://aistudio.google.com) → *Get API key*, signed in with your personal Google account).
 Then tick **Analyse news for setups**.
 
-- Each day the app reads **Google News** headlines from the last two days for every setup stock, plus its sector.
-  It keeps only headlines that name the company.
+- Each day the app reads **Google News** for every setup stock and its sector. It keeps only headlines that:
+  - come from your **trusted outlets**: by default Economic Times, Business Standard, Mint, Moneycontrol, Reuters,
+    Financial Express, BusinessLine, CNBC-TV18, NDTV Profit, Bloomberg, Business Today and The Hindu. You can edit
+    the list in the News dialog; leave it empty to allow any site.
+  - are from the **last 7 days**, checked against each article's own date.
+  - **name the company** (or, for sector news, the sector).
+  - aren't share-price listing pages.
+- Every rating keeps its headlines with their outlet, date and link, so you can check it. Trusted outlets cover most
+  stocks only a few times a week. A stock with no trusted news in the past week counts as neutral (0), and its NEWS
+  value comes only from its sector.
 - **Gemini** rates them from −1 (negative) to +1 (positive). The NEWS value is 70% the stock's own news and 30% its
   sector's: ▲ is positive and ▼ is negative.
 - **Double-click** a Live setups row to read the headlines and Gemini's one-line summaries.

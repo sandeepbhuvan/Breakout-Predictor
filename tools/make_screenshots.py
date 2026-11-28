@@ -163,14 +163,17 @@ NEWS = {"ACMEPOWER": 0.62, "NOVACHEM": 0.18, "ORBITFIN": 0.0, "TERRAINFRA": 0.41
 bp.write_json(bp.APP_DIR / f"news_{bp.today_str()}.json", {
     "stocks": {"ACMEPOWER": {"score": 0.62, "stock_score": 0.8, "sector": "Power", "time": "10:42",
                              "summary": "New capacity orders and a strong quarter point to higher earnings.",
-                             "headlines": [{"title": t, "source": src, "link": ""} for t, src in [
-                                 ("Acme Power wins 1.2 GW solar order from state utility", "Demo Business Daily"),
-                                 ("Acme Power Q2 profit rises 28% on higher plant load", "Demo Markets"),
-                                 ("Brokerage raises Acme Power target price on order book", "Demo Money")]]}},
+                             "headlines": [{"title": t, "source": src, "link": "", "date": d} for t, src, d in [
+                                 ("Acme Power wins 1.2 GW solar order from state utility", "Demo Business Daily",
+                                  "2026-11-20"),
+                                 ("Acme Power Q2 profit rises 28% on higher plant load", "Demo Markets", "2026-11-18"),
+                                 ("Brokerage raises Acme Power target price on order book", "Demo Money",
+                                  "2026-11-17")]]}},
     "sectors": {"Power": {"score": 0.2, "summary": "Steady demand growth; power stocks near highs.",
-                          "headlines": [{"title": t, "source": src, "link": ""} for t, src in [
-                              ("India's peak power demand hits record in November", "Demo Energy News"),
-                              ("Power stocks extend rally as demand outlook improves", "Demo Markets")]]}}})
+                          "headlines": [{"title": t, "source": src, "link": "", "date": d} for t, src, d in [
+                              ("India's peak power demand hits record in November", "Demo Energy News", "2026-11-19"),
+                              ("Power stocks extend rally as demand outlook improves", "Demo Markets",
+                               "2026-11-18")]]}}})
 app.cfg["news_enabled"] = True
 app.gemini_key_var.set("demo")
 app._update_news_btn()

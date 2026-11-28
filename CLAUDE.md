@@ -82,7 +82,11 @@ Changing the scoring changes all three.
 
 **News sentiment.**
 - `NewsDesk` (used by `Engine.scan_once` when the app sets `engine.news`) fetches Google News RSS (`google_news`).
-  It keeps headlines that name the company (`mentions`), then makes one `gemini_json_any` call per sector (key in
+  `trusted_news` keeps only headlines from the `news_sources` allowlist (`from_trusted`, by the RSS source URL) from
+  the last `NEWS_DAYS`, date-checked locally because Google ignores `when:` in `site:` OR queries. It also drops
+  quote pages (`QUOTE_PAGE`) and keeps only headlines naming the company (`mentions`) or the sector
+  (`sector_keywords` / `SECTOR_QUERIES`). Write regexes with the Edit/Write tools: shell heredocs have turned `\b`
+  into backspace characters here before. It then makes one `gemini_json_any` call per sector (key in
   the `x-goog-api-key` header). The model is `auto` by default: `GEMINI_AUTO_MODELS`, best free model first. Free-tier 503s are common, so a busy model
   is skipped for `GEMINI_BUSY_COOLDOWN` and an unavailable one for the day (`NewsDesk._skip`).
 - Results are cached in `APP_DIR/news_DATE.json`.
