@@ -250,6 +250,14 @@ def step4c():
     dlg = app.winfo_children()[-1]
     save_png(grab(dlg), OUT / "news_settings.png")
     dlg.destroy()
+    app.open_email_dialog()
+    app.after(600, step4d)
+
+
+def step4d():
+    dlg = app.winfo_children()[-1]
+    save_png(grab(dlg), OUT / "email.png")
+    dlg.destroy()
     app.open_help()
     app.after(800, step5)
 

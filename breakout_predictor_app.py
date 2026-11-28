@@ -26,10 +26,13 @@ Secrets (Upstox token, SMTP password) are never written to disk; they can be pre
 environment variables UPSTOX_ACCESS_TOKEN and HHLL_SMTP_PASSWORD.
 """
 
+import base64
 import bisect
 import csv
 import email.utils
 import gzip
+import hashlib
+import http.server
 import io
 import json
 import os
@@ -52,7 +55,7 @@ from email.mime.text import MIMEText
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 IST = timezone(timedelta(hours=5, minutes=30))
 APP_DIR = Path.home() / ".breakout_predictor"
@@ -83,6 +86,7 @@ DEFAULT_CONFIG = {
     "max_dist_pct": 3.0,
     "min_price": 20.0,
     "nifty_csv_path": "",
+    "email_mode": "gmail",  # "gmail" = Sign in with Google; "smtp" = any SMTP server
     "smtp_host": "smtp.gmail.com",
     "smtp_port": 465,
     "smtp_user": "",
@@ -1492,6 +1496,212 @@ def send_email(cfg, password, subject, html):
             s.sendmail(cfg["smtp_user"], recipients, msg.as_string())
 
 
+# =========================================================================== Gmail (Sign in with Google)
+GOOGLE_AUTH = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN = "https://oauth2.googleapis.com/token"
+GOOGLE_REVOKE = "https://oauth2.googleapis.com/revoke"
+GOOGLE_USERINFO = "https://openidconnect.googleapis.com/v1/userinfo"
+GMAIL_SEND = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
+GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"  # send only: the app can't read the mailbox
+GMAIL_SCOPES = f"openid email {GMAIL_SEND_SCOPE}"
+
+
+class GmailError(Exception):
+    pass
+
+
+def _b64url(data):
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def read_oauth_client_file(path):
+    """client_id / client_secret from the JSON Google Cloud gives you for a 'Desktop app' OAuth client."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    c = data.get("installed") or data.get("web") or data
+    if not c.get("client_id") or not c.get("client_secret"):
+        raise GmailError("That file isn't a Google OAuth client file (no client_id / client_secret).")
+    if "web" in data:
+        raise GmailError("That's a 'Web application' client. Create a 'Desktop app' client instead.")
+    return {"client_id": c["client_id"], "client_secret": c["client_secret"]}
+
+
+class GmailSender:
+    """Sends alert emails through the Gmail API as the signed-in Google account.
+
+    Sign-in is Google's installed-app flow: the browser opens Google's consent page, Google redirects to a one-off
+    local port (127.0.0.1), and the code is exchanged with PKCE. Only the gmail.send scope is requested. The OAuth
+    client and the refresh token are stored with save_secret (Windows DPAPI), never synced or uploaded."""
+
+    def __init__(self):
+        self.client = self._load("google_client")
+        self.account = self._load("gmail")  # {"refresh_token", "email"}
+        self._access, self._expires = None, 0.0
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _load(name):
+        raw = load_secret(name)
+        try:
+            return json.loads(raw) if raw else None
+        except ValueError:
+            return None
+
+    @property
+    def email(self):
+        return (self.account or {}).get("email", "")
+
+    @property
+    def signed_in(self):
+        return bool(self.account and self.account.get("refresh_token"))
+
+    def set_client(self, client):
+        save_secret("google_client", json.dumps(client))
+        self.client = client
+
+    @staticmethod
+    def _post(url, form):
+        req = urllib.request.Request(url, data=urllib.parse.urlencode(form).encode(), method="POST",
+                                     headers={"Content-Type": "application/x-www-form-urlencoded",
+                                              "User-Agent": APP_USER_AGENT})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            try:
+                err = json.loads(e.read())
+            except ValueError:
+                err = {}
+            raise GmailError(f"{err.get('error', e.code)}: {err.get('error_description', '')}".strip(": ")) from None
+
+    def sign_in(self, open_browser=webbrowser.open, timeout=300):
+        """Run the browser sign-in; blocks until Google redirects back (or timeout). Returns the email."""
+        if not self.client:
+            raise GmailError("Load your Google OAuth client file first (see the steps in this dialog).")
+        verifier = _b64url(os.urandom(48))
+        state = _b64url(os.urandom(16))
+        got, done = {}, threading.Event()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                if "code" not in q and "error" not in q:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                got.update({k: v[0] for k, v in q.items()})
+                ok = "code" in q and q.get("state", [""])[0] == state
+                body = ("<h2>Signed in. You can close this tab and return to Breakout Predictor.</h2>" if ok else
+                        "<h2>Sign-in didn't complete. Return to Breakout Predictor and try again.</h2>")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(f"<html><body style='font-family:Segoe UI,sans-serif'>{body}</body></html>".encode())
+                done.set()
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        redirect = f"http://127.0.0.1:{server.server_port}"
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            open_browser(GOOGLE_AUTH + "?" + urllib.parse.urlencode({
+                "client_id": self.client["client_id"], "redirect_uri": redirect, "response_type": "code",
+                "scope": GMAIL_SCOPES, "state": state, "access_type": "offline", "prompt": "consent",
+                "code_challenge": _b64url(hashlib.sha256(verifier.encode()).digest()),
+                "code_challenge_method": "S256"}))
+            if not done.wait(timeout):
+                raise GmailError("Timed out waiting for Google sign-in in the browser.")
+        finally:
+            server.shutdown()
+        if got.get("error"):
+            raise GmailError(f"Google sign-in was cancelled or refused ({got['error']}).")
+        if got.get("state") != state:
+            raise GmailError("Sign-in reply didn't match this request; try again.")
+        tok = self._post(GOOGLE_TOKEN, {"code": got["code"], "client_id": self.client["client_id"],
+                                        "client_secret": self.client["client_secret"], "redirect_uri": redirect,
+                                        "grant_type": "authorization_code", "code_verifier": verifier})
+        if GMAIL_SEND_SCOPE not in tok.get("scope", "").split():
+            raise GmailError("Gmail send permission wasn't granted. Sign in again and tick 'Send email on your behalf'.")
+        if not tok.get("refresh_token"):
+            raise GmailError("Google didn't return a refresh token; sign in again.")
+        req = urllib.request.Request(GOOGLE_USERINFO, headers={"Authorization": f"Bearer {tok['access_token']}",
+                                                               "User-Agent": APP_USER_AGENT})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            email = json.loads(resp.read()).get("email", "")
+        self.account = {"refresh_token": tok["refresh_token"], "email": email}
+        save_secret("gmail", json.dumps(self.account))
+        with self._lock:
+            self._access, self._expires = tok["access_token"], time.time() + int(tok.get("expires_in", 3600)) - 60
+        return email
+
+    def _access_token(self):
+        with self._lock:
+            if self._access and time.time() < self._expires:
+                return self._access
+            if not self.signed_in or not self.client:
+                raise GmailError("Not signed in to Gmail.")
+            try:
+                tok = self._post(GOOGLE_TOKEN, {"client_id": self.client["client_id"],
+                                                "client_secret": self.client["client_secret"],
+                                                "refresh_token": self.account["refresh_token"],
+                                                "grant_type": "refresh_token"})
+            except GmailError as e:
+                if "invalid_grant" in str(e):
+                    raise GmailError("Gmail sign-in expired or was revoked: open Email and sign in again. (If the "
+                                     "Google Cloud app is still in 'Testing', its sign-ins expire after 7 days; "
+                                     "publish it to stop that.)") from None
+                raise
+            self._access, self._expires = tok["access_token"], time.time() + int(tok.get("expires_in", 3600)) - 60
+            return self._access
+
+    def send(self, recipients, subject, html):
+        msg = MIMEText(html, "html", "utf-8")
+        msg["Subject"], msg["From"], msg["To"] = subject, self.email, ", ".join(recipients)
+        body = json.dumps({"raw": _b64url(msg.as_bytes())}).encode()
+        req = urllib.request.Request(GMAIL_SEND, data=body, method="POST", headers={
+            "Authorization": f"Bearer {self._access_token()}", "Content-Type": "application/json",
+            "User-Agent": APP_USER_AGENT})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read()).get("id")
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:200]
+            hint = " (is the Gmail API enabled in your Google Cloud project?)" if e.code == 403 else ""
+            raise GmailError(f"Gmail send failed: HTTP {e.code}{hint} {detail}") from None
+
+    def sign_out(self):
+        if self.signed_in:
+            try:
+                self._post(GOOGLE_REVOKE, {"token": self.account["refresh_token"]})
+            except (GmailError, OSError):
+                pass  # already revoked or offline: forget it locally anyway
+        self.account, self._access, self._expires = None, None, 0.0
+        save_secret("gmail", "")
+
+
+def email_recipients(cfg, gmail=None):
+    to = [r.strip() for r in str(cfg.get("email_to", "")).split(",") if r.strip()]
+    if not to and cfg.get("email_mode", "gmail") == "gmail" and gmail and gmail.email:
+        to = [gmail.email]  # default: send alerts to yourself
+    return to
+
+
+def email_ready(cfg, smtp_password, gmail):
+    if cfg.get("email_mode", "gmail") == "gmail":
+        return bool(gmail and gmail.signed_in and email_recipients(cfg, gmail))
+    return bool(cfg.get("smtp_host") and cfg.get("smtp_user") and cfg.get("email_to") and smtp_password)
+
+
+def deliver_email(cfg, smtp_password, gmail, subject, html):
+    """Send through Gmail (signed-in account) or SMTP, per the email_mode setting."""
+    if cfg.get("email_mode", "gmail") == "gmail":
+        if not (gmail and gmail.signed_in):
+            raise GmailError("Not signed in to Gmail.")
+        return gmail.send(email_recipients(cfg, gmail), subject, html)
+    return send_email(cfg, smtp_password, subject, html)
+
+
 def alert_html(rows, cfg, when, stats):
     td = "padding:6px 8px;border-bottom:1px solid #ddd;"
     body = "".join(
@@ -1553,6 +1763,7 @@ class Engine(threading.Thread):
         self.key_by_symbol = {}
         self.preview_for = None
         self.news = None        # NewsDesk when news sentiment is on (set by the app)
+        self.gmail = None       # GmailSender when signed in with Google (set by the app)
         self.names = {}         # symbol -> company name, for news searches
         self.news_skipped = set()
 
@@ -1566,8 +1777,7 @@ class Engine(threading.Thread):
         self.stop_event.set()
 
     def email_enabled(self):
-        c = self.cfg
-        return bool(c["smtp_host"] and c["smtp_user"] and c["email_to"] and self.smtp_password)
+        return email_ready(self.cfg, self.smtp_password, self.gmail)
 
     def run(self):
         try:
@@ -1784,10 +1994,10 @@ class Engine(threading.Thread):
             self.log("Daily email cap reached; shown here only.")
         else:
             try:
-                send_email(self.cfg, self.smtp_password, subject, html)
+                deliver_email(self.cfg, self.smtp_password, self.gmail, subject, html)
                 state["sent"] += 1
                 write_json(state_path, state)
-                self.log(f"Email sent to {self.cfg['email_to']}: {subject}")
+                self.log(f"Email sent to {', '.join(email_recipients(self.cfg, self.gmail))}: {subject}")
             except Exception as e:  # noqa: BLE001
                 self.log(f"Email failed: {e}")
 
@@ -2157,6 +2367,7 @@ class App(tk.Tk):
         self.row_count = None
         self.live_prices = {}
         self.smtp_pw_var = tk.StringVar(value=os.environ.get("HHLL_SMTP_PASSWORD", ""))
+        self.gmail = GmailSender()
         self.gemini_key_var = tk.StringVar(value=os.environ.get("GEMINI_API_KEY", "") or load_secret("gemini"))
         global ACCOUNT
         ACCOUNT = CloudAccount(notify=lambda kind, payload: self.events.put(("cloud", kind, payload)))
@@ -2234,6 +2445,10 @@ class App(tk.Tk):
                         lightcolor=bg, darkcolor=bg, padding=(12, 5), font=(FONT, 9, "bold"), focuscolor=bg)
             s.map(f"{name}.TButton", background=[("active", hover)], lightcolor=[("active", hover)],
                   darkcolor=[("active", hover)], foreground=[("active", P["text"])])
+        s.configure("Card.TRadiobutton", background=P["surface"], foreground=P["text"], focuscolor=P["surface"],
+                    indicatorbackground=P["surface2"], indicatorforeground=P["accent"], indicatormargin=(0, 0, 8, 0))
+        s.map("Card.TRadiobutton", background=[("active", P["surface"])],
+              indicatorbackground=[("selected", P["accent"]), ("active", P["surface2"])])
         s.configure("Card.TCheckbutton", background=P["surface"], foreground=P["text"], focuscolor=P["surface"],
                     indicatorbackground=P["surface2"], indicatorforeground=P["accent"], indicatormargin=(0, 0, 8, 0))
         s.map("Card.TCheckbutton", background=[("active", P["surface"])],
@@ -3041,10 +3256,13 @@ class App(tk.Tk):
         win.bind("<Escape>", lambda e: win.destroy())
 
     def _update_email_hint(self):
-        to = self.cfg.get("email_to")
-        ready = to and self.cfg.get("smtp_user") and self.smtp_pw_var.get()
-        self.email_hint.configure(text="✉  Email: on" if ready else
-                                  "✉  Email: off" if not to else "✉  Email: needs password")
+        if email_ready(self.cfg, self.smtp_pw_var.get(), self.gmail):
+            text = "✉  Email: on"
+        elif self.cfg.get("email_mode", "gmail") == "gmail":
+            text = "✉  Email: off"
+        else:
+            text = "✉  Email: off" if not self.cfg.get("email_to") else "✉  Email: needs password"
+        self.email_hint.configure(text=text)
 
     def _refresh_stats(self):
         preds = load_predictions()
@@ -3087,25 +3305,122 @@ class App(tk.Tk):
         win.configure(bg=P["bg"])
         win.transient(self)
         win.resizable(False, False)
-        outer, c = self._card(win, "Email alerts", "Gmail: use an App Password")
+        outer, c = self._card(win, "Email alerts", "Gmail or any SMTP server")
         outer.pack(fill="both", expand=True, padx=20, pady=20)
+        mode_var = tk.StringVar(value=self.cfg.get("email_mode", "gmail"))
+        modes = ttk.Frame(c, style="Card.TFrame")
+        modes.pack(fill="x", pady=(0, 12))
+        gmail_box = ttk.Frame(c, style="Card.TFrame")
+        smtp_box = ttk.Frame(c, style="Card.TFrame")
+        common = ttk.Frame(c, style="Card.TFrame")
+
+        # Gmail: Sign in with Google
+        who = ttk.Label(gmail_box, style="Card.TLabel")
+        who.pack(anchor="w")
+        client_lbl = ttk.Label(gmail_box, style="Hint.TLabel")
+        client_lbl.pack(anchor="w", pady=(2, 8))
+        status = ttk.Label(gmail_box, text="", style="Hint.TLabel", wraplength=int(520 * self.k), justify="left")
+
+        def refresh():
+            g = self.gmail
+            who.configure(text=f"Signed in as {g.email}" if g.signed_in else "Not signed in",
+                          foreground=P["green"] if g.signed_in else P["muted"])
+            client_lbl.configure(text="Google OAuth client: loaded" if g.client else
+                                 "Google OAuth client: not set up yet (one-time step below)")
+            sign_btn.configure(state="normal" if g.client else "disabled")
+            out_btn.configure(state="normal" if g.signed_in else "disabled")
+            self._update_email_hint()
+
+        def load_client():
+            path = filedialog.askopenfilename(parent=win, title="Google OAuth client file (client_secret_….json)",
+                                              filetypes=[("JSON", "*.json"), ("All files", "*.*")])
+            if not path:
+                return
+            try:
+                self.gmail.set_client(read_oauth_client_file(path))
+                status.configure(text="Client loaded. Now click Sign in with Google.", foreground=P["green"])
+            except (GmailError, OSError, ValueError) as e:
+                status.configure(text=str(e), foreground=P["red"])
+            refresh()
+
+        def sign_in():
+            status.configure(text="Finish signing in in your browser (choose your Gmail account and allow "
+                                  "'Send email on your behalf')…", foreground=P["muted"])
+            sign_btn.configure(state="disabled")
+
+            def work():
+                try:
+                    email = self.gmail.sign_in()
+                    msg = (f"Signed in as {email}. Alerts will be sent from this Gmail account.", P["green"])
+                except (GmailError, OSError) as e:
+                    msg = (str(e), P["red"])
+                self.events.put(("call", lambda: win.winfo_exists() and (
+                    status.configure(text=msg[0], foreground=msg[1]), refresh())))
+            threading.Thread(target=work, daemon=True).start()
+
+        def sign_out():
+            self.gmail.sign_out()
+            status.configure(text="Signed out, and the app's access was revoked at Google.", foreground=P["muted"])
+            refresh()
+
+        btns = ttk.Frame(gmail_box, style="Card.TFrame")
+        btns.pack(fill="x", pady=(0, 6))
+        sign_btn = ttk.Button(btns, text="G  Sign in with Google", style="Accent.TButton", command=sign_in)
+        sign_btn.pack(side="left")
+        out_btn = ttk.Button(btns, text="Sign out", style="Ghost.TButton", command=sign_out)
+        out_btn.pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="Load client file…", style="Ghost.TButton", command=load_client).pack(side="right")
+        status.pack(anchor="w", pady=(0, 8))
+        ttk.Label(gmail_box, style="Hint.TLabel", justify="left", text=(
+            "One-time setup at console.cloud.google.com, signed in with your Gmail:\n"
+            "1. Pick (or create) a project, e.g. your Firebase project. APIs & Services → enable the Gmail API.\n"
+            "2. Google Auth Platform: set up the consent screen (External), then Publish the app, so the sign-in\n"
+            "    doesn't expire every 7 days. Google will say it's unverified; that's fine for personal use.\n"
+            "3. Clients → Create client → Desktop app → download the JSON, then Load client file… here.\n"
+            "The app asks only to send mail; it can't read your inbox. Everything stays on this PC, encrypted.")
+        ).pack(anchor="w", pady=(0, 6))
+
+        # other SMTP server
         local = {}
         for k, label in [("smtp_host", "SMTP host"), ("smtp_port", "Port (465 = SSL, 587 = STARTTLS)"),
-                         ("smtp_user", "From / login"), ("email_to", "Send to (comma separated)"),
+                         ("smtp_user", "From / login")]:
+            local[k] = self.vars.get(k) or tk.StringVar(value=str(self.cfg[k]))
+            self.vars[k] = local[k]
+            self._field(smtp_box, label, var=local[k], width=48)
+        self._field(smtp_box, "Password (kept in memory only)", var=self.smtp_pw_var, show="•", width=48)
+
+        for k, label in [("email_to", "Send to (comma separated; empty = your Gmail when signed in with Google)"),
                          ("max_emails_per_day", "Max emails per day")]:
             local[k] = self.vars.get(k) or tk.StringVar(value=str(self.cfg[k]))
             self.vars[k] = local[k]
-            self._field(c, label, var=local[k], width=40)
-        self._field(c, "Password (kept in memory only)", var=self.smtp_pw_var, show="•", width=40)
+            self._field(common, label, var=local[k], width=48)
+
+        def show():
+            gmail_box.pack_forget()
+            smtp_box.pack_forget()
+            common.pack_forget()
+            (gmail_box if mode_var.get() == "gmail" else smtp_box).pack(fill="x")
+            common.pack(fill="x")
+            row.pack_forget()
+            row.pack(fill="x", pady=(4, 0))
+        for val, text in (("gmail", "Gmail: Sign in with Google"), ("smtp", "Other SMTP server")):
+            ttk.Radiobutton(modes, text=text, value=val, variable=mode_var, style="Card.TRadiobutton",
+                            command=show).pack(side="left", padx=(0, 18))
         row = ttk.Frame(c, style="Card.TFrame")
-        row.pack(fill="x", pady=(4, 0))
 
         def save():
+            self.cfg["email_mode"] = mode_var.get()
             if self._collect():
                 self._update_email_hint()
                 win.destroy()
-        ttk.Button(row, text="Send test email", style="Ghost.TButton", command=self.test_email).pack(side="left")
+
+        def test():
+            self.cfg["email_mode"] = mode_var.get()
+            self.test_email()
+        ttk.Button(row, text="Send test email", style="Ghost.TButton", command=test).pack(side="left")
         ttk.Button(row, text="Save", style="Accent.TButton", command=save).pack(side="right")
+        show()
+        refresh()
         win.grab_set()
 
     # ------------------------------------------------------------------ help
@@ -3164,10 +3479,16 @@ class App(tk.Tk):
               f"{HORIZON} sessions, a miss is anything else. Filter by hits, misses or still open."),
         ("img", "track.png"),
         ("h2", "9.  Email alerts, news and your account"),
-        ("p", "The Email button opens the SMTP settings (for Gmail: smtp.gmail.com, port 465 and an App Password). "
+        ("p", "The Email button sets up email alerts: Sign in with Google to send them from your Gmail (one-time "
+              "setup steps are in the dialog), or use any SMTP server. "
               "News turns on news sentiment (next step). Sign in creates a free account so predictions, buy-ins, "
               "your own trades and settings follow you to any PC. ? opens this guide (or press F1)."),
         ("img", "header.png"),
+        ("p", "Email with Gmail: the first time, follow the three setup steps in the Email dialog (enable the Gmail "
+              "API and create a 'Desktop app' OAuth client in Google Cloud, signed in with your Gmail), then click "
+              "Load client file… and Sign in with Google. The app asks only for permission to send mail. The "
+              "sign-in is saved encrypted on this PC, and Sign out revokes it."),
+        ("img", "email.png"),
         ("h2", "10.  News sentiment (optional)"),
         ("p", "Click News in the header, paste a free Gemini API key (aistudio.google.com → Get API key, signed in "
               "with your personal Google account) and tick Analyse news for setups. Each day the app reads the last "
@@ -3482,6 +3803,7 @@ class App(tk.Tk):
             return
         self.mode = mode
         self.engine = Engine(cfg, token, self.smtp_pw_var.get(), self.events, mode)
+        self.engine.gmail = self.gmail
         if cfg.get("news_enabled") and mode != "backtest":
             key = self.gemini_key_var.get().strip()
             if key:
@@ -3513,14 +3835,16 @@ class App(tk.Tk):
         if not cfg:
             return
         pw = self.smtp_pw_var.get()
-        if not (cfg["smtp_user"] and cfg["email_to"] and pw):
-            messagebox.showerror("Email", "Fill SMTP login, password and recipients first.")
+        if not email_ready(cfg, pw, self.gmail):
+            messagebox.showerror("Email", "Sign in with Google first." if cfg.get("email_mode", "gmail") == "gmail"
+                                 else "Fill SMTP login, password and recipients first.")
             return
 
         def work():
             try:
-                send_email(cfg, pw, "Breakout predictor test email", "<p>Email alerts are working.</p>")
-                self.events.put(("log", f"[{now_ist():%H:%M:%S}] Test email sent to {cfg['email_to']}"))
+                deliver_email(cfg, pw, self.gmail, "Breakout predictor test email", "<p>Email alerts are working.</p>")
+                self.events.put(("log", f"[{now_ist():%H:%M:%S}] Test email sent to "
+                                        f"{', '.join(email_recipients(cfg, self.gmail))}"))
             except Exception as e:  # noqa: BLE001
                 self.events.put(("log", f"[{now_ist():%H:%M:%S}] Test email failed: {e}"))
         threading.Thread(target=work, daemon=True).start()

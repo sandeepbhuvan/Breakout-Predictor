@@ -4,3 +4,5 @@ __pycache__/
 .env
 legacy/
 firebase_config.json
+client_secret*.json
+*.key

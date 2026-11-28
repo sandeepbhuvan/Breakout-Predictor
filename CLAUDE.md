@@ -23,6 +23,10 @@ table, buy-in rules, emails, accounts, privacy.
   be prefilled from `UPSTOX_ACCESS_TOKEN` and `HHLL_SMTP_PASSWORD`. The Gemini key can also come from `GEMINI_API_KEY`,
   or, if the owner opts in, from `save_secret`/`load_secret` (a Windows DPAPI-encrypted `APP_DIR/gemini.key`). It is
   never synced or written in plain text.
+- Email defaults to Gmail via `GmailSender`: Google's installed-app OAuth (loopback 127.0.0.1 redirect, PKCE,
+  scopes `openid email gmail.send` only), sent through the Gmail API. The owner's Desktop OAuth client and the
+  refresh token are DPAPI secrets (`google_client`, `gmail`). Never commit an OAuth client file or secret. SMTP
+  stays as `email_mode: "smtp"`. All sending goes through `deliver_email` / `email_ready`.
 - `legacy/` (the original Apps Script, which contains a third party's email) and `firebase_config.json` are git-ignored
   and must stay out of commits.
 - Upstox calls must send `APP_USER_AGENT`. Without it, Cloudflare returns 403 / error 1010.

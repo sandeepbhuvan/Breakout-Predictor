@@ -250,8 +250,31 @@ Analytics) is valid for a year and covers everything this app uses; regular trad
 
 ### Email alerts (optional)
 
-Click **Email: off** in the header and enter SMTP details. For Gmail use `smtp.gmail.com`, port `465`, and an
-[App Password](https://support.google.com/accounts/answer/185833).
+Click **Email** in the header and choose how to send:
+
+**Gmail: Sign in with Google (recommended).** Alerts go out through the Gmail API from your own Gmail. There's no
+password: the app asks Google only for permission to **send mail** (`gmail.send`) and can't read your inbox.
+Recipients default to your own address.
+
+One-time setup at [console.cloud.google.com](https://console.cloud.google.com), signed in with your Gmail:
+
+1. Pick a project (your Firebase project works) → **APIs & Services → Library → Gmail API → Enable**.
+2. **Google Auth Platform**: set up the consent screen (*External*, your Gmail as support email). Then, under
+   *Audience*, click **Publish app**. While the app is in *Testing*, Google expires its sign-ins every 7 days.
+   Google will show "this app isn't verified" when you sign in; that's expected for a personal app (*Advanced →
+   Go to …*).
+3. **Clients → Create client → Desktop app → Download JSON.**
+4. In the app's Email dialog: **Load client file…**, then **G Sign in with Google**, choose your Gmail account and
+   allow *Send email on your behalf*.
+
+The OAuth client and the sign-in are stored encrypted with Windows DPAPI in `~/.breakout_predictor`
+(`google_client.key`, `gmail.key`). They're never synced or uploaded. **Sign out** revokes the app's access at
+Google. No Firebase changes are needed.
+
+<img src="docs/images/email.png" width="560" alt="Email settings">
+
+**Other SMTP server.** Enter host, port, login and password, as before. For Gmail over SMTP use `smtp.gmail.com`,
+port `465`, and an [App Password](https://support.google.com/accounts/answer/185833).
 
 ## Accounts and cloud sync (optional, Firebase)
 
@@ -286,7 +309,8 @@ To point a copy at another project, create `firebase_config.json` next to the ap
 
 The Upstox token and SMTP password are kept in memory only and are never written to disk. The Gemini API key
 too, unless you tick *Remember the key on this PC*: then it's stored encrypted with Windows DPAPI (readable only by
-your Windows account) and never synced. They can be prefilled
+your Windows account) and never synced. The same goes for the Gmail sign-in (OAuth client and refresh token):
+encrypted on this PC only, with the `gmail.send` permission only, and revoked by **Sign out**. They can be prefilled
 from the environment variables `UPSTOX_ACCESS_TOKEN`, `HHLL_SMTP_PASSWORD` and `GEMINI_API_KEY`. With news
 sentiment on, setup stocks' company and sector names go to Google News, and their headlines go to Gemini. Settings, cached history and the
 prediction log live in `~/.breakout_predictor` (per account under `users/<uid>` when signed in). When signed in,
