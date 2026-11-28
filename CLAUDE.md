@@ -11,11 +11,16 @@ table, buy-in rules, emails, accounts, privacy.
 
 ## Hard constraints
 
+- **Identity: this is a personal project of sandeepbhuvan@gmail.com only.** Never associate it with the owner's work
+  email or any work account in any manner: commits, git config, code, docs, Firebase, Gemini, Upstox, GitHub, emails.
+  The repo's local `git config user.email` must stay `sandeepbhuvan@gmail.com` (the machine's global one is the work
+  address). Any API key or account the app needs is created by the owner under that Gmail account.
+
 - **Python standard library only.** No pip dependencies: Tkinter, urllib, smtplib, ctypes, zlib. Firebase is called
   over REST, not the SDK. The tray icon and screenshot capture are raw Win32 through ctypes. Keep it that way.
 - On this machine `python` is a broken WindowsApps alias. Use `py` (or `pyw` for no console). Python 3.14.
-- The Upstox token and SMTP password live in memory only. They are never written to disk or sent to Firebase. They can
-  be prefilled from the `UPSTOX_ACCESS_TOKEN` and `HHLL_SMTP_PASSWORD` environment variables.
+- The Upstox token, SMTP password and Gemini API key live in memory only. They are never written to disk or sent to
+  Firebase. They can be prefilled from `UPSTOX_ACCESS_TOKEN`, `HHLL_SMTP_PASSWORD` and `GEMINI_API_KEY`.
 - `legacy/` (the original Apps Script, which contains a third party's email) and `firebase_config.json` are git-ignored
   and must stay out of commits.
 - Upstox calls must send `APP_USER_AGENT`. Without it, Cloudflare returns 403 / error 1010.
@@ -72,6 +77,16 @@ Changing the scoring changes all three.
   `MAX_HOLD`, `STOP_BUFFER`; each record stores its `stop_buffer`, and an entered trade keeps its own; a day that touches both stop and target counts as the stop; gaps fill at the open). The
   rebuild is the official record.
 - `check_trades_live` only sends intraday alerts. Its `alert_*` flags must survive rebuilds.
+
+**News sentiment.**
+- `NewsDesk` (used by `Engine.scan_once` when the app sets `engine.news`) fetches Google News RSS (`google_news`).
+  It keeps headlines that name the company (`mentions`), then makes one `gemini_json` call per sector (key in the
+  `x-goog-api-key` header).
+- Results are cached in `APP_DIR/news_DATE.json`.
+- The rows get `news` (the combined score), the optional `news_filter` drops rows at or below `NEG_NEWS`, and
+  predictions store `news`.
+- News is deliberately not part of the score: it can't be backtested.
+- Tests point `GEMINI_API` at a local fake server.
 
 **User data and merging.**
 - `predictions.json` and `trades.json` live in `data_dir()`: `APP_DIR/users/<uid>/` when signed in, else `APP_DIR`.

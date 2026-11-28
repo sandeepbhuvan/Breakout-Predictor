@@ -93,16 +93,41 @@ anything else is a **miss**. Filter by hits, misses or open.
 
 ![Track record](docs/images/track.png)
 
-### 9. Email alerts, account and help
+### 9. Email alerts, news, account and help
 
 - **Email** opens the SMTP settings.
+- **News** turns on news sentiment (step 10).
 - **Account** signs you in so your data follows you to any PC.
 - The pill shows whether the predictor is running.
 - **?** opens the guide.
 
 <img src="docs/images/header.png" width="540" alt="Header buttons">
 
-### 10. Activity log
+### 10. News sentiment (optional)
+
+Click **News** in the header and paste a free **Gemini API key** (create it at
+[aistudio.google.com](https://aistudio.google.com) → *Get API key*, signed in with your personal Google account).
+Then tick **Analyse news for setups**.
+
+- Each day the app reads **Google News** headlines from the last two days for every setup stock, plus its sector.
+  It keeps only headlines that name the company.
+- **Gemini** rates them from −1 (negative) to +1 (positive). The NEWS value is 70% the stock's own news and 30% its
+  sector's: ▲ is positive and ▼ is negative.
+- **Double-click** a Live setups row to read the headlines and Gemini's one-line summaries.
+- **Skip setups with negative news** (optional) hides setups scoring −0.25 or lower and doesn't log or email them.
+- One Gemini call per sector per day covers all of that sector's setups, and results are cached for the day, so
+  the free tier is plenty. The default model is `gemini-3.5-flash-lite`, which you can change in the same dialog.
+- The key is kept in memory only, like the Upstox token. To skip pasting it at every start, set it as the
+  `GEMINI_API_KEY` environment variable: `setx GEMINI_API_KEY "your-key"`, then restart the app.
+- Only public headlines are sent to Gemini. On the free tier, Google may use requests to improve its products.
+- News is **not** part of the setup score: there's no news history to backtest it against. Each prediction saves
+  its news value, so the track record can show over time whether it helps.
+
+<img src="docs/images/news_settings.png" width="520" alt="News settings">
+
+![News for a stock](docs/images/news.png)
+
+### 11. Activity log
 
 The log shows what the app is doing: downloads, scans, alerts and errors.
 
@@ -238,8 +263,9 @@ To point a copy at another project, create `firebase_config.json` next to the ap
 
 ## Privacy
 
-The Upstox token and SMTP password are kept in memory only and are never written to disk. They can be prefilled
-from the environment variables `UPSTOX_ACCESS_TOKEN` and `HHLL_SMTP_PASSWORD`. Settings, cached history and the
+The Upstox token, SMTP password and Gemini API key are kept in memory only and are never written to disk. They can be prefilled
+from the environment variables `UPSTOX_ACCESS_TOKEN`, `HHLL_SMTP_PASSWORD` and `GEMINI_API_KEY`. With news
+sentiment on, setup stocks' company and sector names go to Google News, and their headlines go to Gemini. Settings, cached history and the
 prediction log live in `~/.breakout_predictor` (per account under `users/<uid>` when signed in). When signed in,
 `session.json` there holds the Firebase sign-in session so you stay signed in, like a browser cookie; **Sign out**
 deletes it.

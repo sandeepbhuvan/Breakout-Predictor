@@ -157,8 +157,25 @@ OUT.mkdir(parents=True, exist_ok=True)
 app = bp.App()
 # Must stay fully on screen: PrintWindow leaves off-screen pixels blank.
 app.geometry("1880x1000+0+0")
-app._show_rows([{"symbol": s, "industry": ind, "ltp": ltp, "R": r, "dist": d, "score": sc, "reasons": why}
-                for s, ind, ltp, r, d, sc, why in LIVE], {"ACMEPOWER", "ORBITFIN"},
+NEWS = {"ACMEPOWER": 0.62, "NOVACHEM": 0.18, "ORBITFIN": 0.0, "TERRAINFRA": 0.41, "HELIXPHARMA": -0.08,
+        "ZENITHAUTO": 0.27}
+# made-up headlines for the made-up stocks, so the news window has something to show
+bp.write_json(bp.APP_DIR / f"news_{bp.today_str()}.json", {
+    "stocks": {"ACMEPOWER": {"score": 0.62, "stock_score": 0.8, "sector": "Power", "time": "10:42",
+                             "summary": "New capacity orders and a strong quarter point to higher earnings.",
+                             "headlines": [{"title": t, "source": src, "link": ""} for t, src in [
+                                 ("Acme Power wins 1.2 GW solar order from state utility", "Demo Business Daily"),
+                                 ("Acme Power Q2 profit rises 28% on higher plant load", "Demo Markets"),
+                                 ("Brokerage raises Acme Power target price on order book", "Demo Money")]]}},
+    "sectors": {"Power": {"score": 0.2, "summary": "Steady demand growth; power stocks near highs.",
+                          "headlines": [{"title": t, "source": src, "link": ""} for t, src in [
+                              ("India's peak power demand hits record in November", "Demo Energy News"),
+                              ("Power stocks extend rally as demand outlook improves", "Demo Markets")]]}}})
+app.cfg["news_enabled"] = True
+app.gemini_key_var.set("demo")
+app._update_news_btn()
+app._show_rows([{"symbol": s, "industry": ind, "ltp": ltp, "R": r, "dist": d, "score": sc, "reasons": why,
+                 "news": NEWS.get(s)} for s, ind, ltp, r, d, sc, why in LIVE], {"ACMEPOWER", "ORBITFIN"},
                {"NOVACHEM": "Nov 18", "TERRAINFRA": "Nov 19", "HELIXPHARMA": "Nov 19", "ZENITHAUTO": "Nov 20"})
 for line in LOG:
     app._log(line.split("  ", 1)[1])
@@ -184,8 +201,8 @@ def step1():
     save_png(shot, OUT / "stats.png", box(app, card_of(app.stat["now"][0]).master))
     save_png(shot, OUT / "live.png", box(app, card_of(app.tab_btns["live"])))
     save_png(shot, OUT / "activity.png", box(app, card_of(app.copy_btn)))
-    save_png(shot, OUT / "header.png", box(app, app.sync_label, app.account_btn, app.email_hint, app.pill,
-                                           app.help_btn, pad=14))
+    save_png(shot, OUT / "header.png", box(app, app.sync_label, app.account_btn, app.news_btn, app.email_hint,
+                                           app.pill, app.help_btn, pad=14))
     app._main_btn_idle()  # the guide explains the buttons as they look before starting
     save_png(grab(app), OUT / "actions.png", box(app, side_cards[2]))
     app._main_btn_running()
@@ -212,6 +229,24 @@ def step3():
 def step4():
     save_png(grab(app), OUT / "track.png", box(app, card_of(app.tab_btns["live"])))
     app._show_tab("live")
+    app.tree.selection_set(app.tree.get_children()[0])
+    app.open_news_window()
+    app.after(600, step4b)
+
+
+def step4b():
+    win = app.winfo_children()[-1]
+    save_png(grab(win), OUT / "news.png")
+    win.destroy()
+    app.gemini_key_var.set("")
+    app.open_news_dialog()
+    app.after(600, step4c)
+
+
+def step4c():
+    dlg = app.winfo_children()[-1]
+    save_png(grab(dlg), OUT / "news_settings.png")
+    dlg.destroy()
     app.open_help()
     app.after(800, step5)
 
