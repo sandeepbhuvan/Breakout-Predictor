@@ -51,8 +51,11 @@ hours), `dry` (one scan) or `backtest`. It never touches Tk. It pushes tuples on
 progress, prices, notify, backtest, error, auth_error, stopped, cloud, tray. The `CloudAccount` push thread and
 `Tray` report through the same queue. Any new background work should do the same.
 
-**One rule set, three users.** `setup_components` / `compute_series` produce the score and the breakout level R (the
-20-day high). They are used by:
+**One rule set, three users.** `setup_components(S, t, rs)` / `compute_series` produce the score (v2, see
+`SCORE_VERSION`) and the breakout level R (the 20-day high). `rs` is `rs_percentile` of the stock's 60-session return
+against every stock on the same day: `returns_by_date` in the backtest, and the live quotes in `scan_once`, which
+appends today's bar from the quote before scoring. Changing the score's meaning means bumping `SCORE_VERSION`: saved
+`min_score` resets once and old synced settings are ignored. Research scripts that justified v2 aren't in the repo. They are used by:
 - the live scan (with quotes as today's bar)
 - the walk-forward `backtest()` (writes `backtest.json`, compared against a baseline of every stock near its high)
 - prediction logging

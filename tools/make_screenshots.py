@@ -98,12 +98,12 @@ def box(win, *widgets, pad=10):
 
 # ------------------------------------------------------------------ demo data (made-up companies)
 LIVE = [
-    ("ACMEPOWER", "Power", 412.35, 418.90, 1.56, 88, ["volume accumulation", "higher lows", "3 tests"]),
-    ("NOVACHEM", "Chemicals", 1284.10, 1302.00, 1.37, 84, ["squeeze", "range contracting", "uptrend"]),
-    ("ORBITFIN", "Financial Services", 96.80, 98.75, 1.97, 79, ["higher lows", "volume accumulation"]),
-    ("TERRAINFRA", "Construction", 2210.00, 2264.50, 2.41, 74, ["squeeze", "uptrend", "2 tests"]),
-    ("HELIXPHARMA", "Healthcare", 731.45, 748.00, 2.21, 71, ["range contracting", "higher lows"]),
-    ("ZENITHAUTO", "Automobile", 5122.00, 5260.00, 2.62, 68, ["tight base", "uptrend"]),
+    ("ACMEPOWER", "Power", 412.35, 418.90, 1.56, 88, ["stronger than 94% of stocks", "up 7% in 5 days", "uptrend"]),
+    ("NOVACHEM", "Chemicals", 1284.10, 1302.00, 1.37, 84, ["stronger than 88% of stocks", "near 1-year high"]),
+    ("ORBITFIN", "Financial Services", 96.80, 98.75, 1.97, 79, ["up 5% in 5 days", "uptrend", "accumulation"]),
+    ("TERRAINFRA", "Construction", 2210.00, 2264.50, 2.41, 76, ["stronger than 81% of stocks", "uptrend"]),
+    ("HELIXPHARMA", "Healthcare", 731.45, 748.00, 2.21, 73, ["near 1-year high", "accumulation"]),
+    ("ZENITHAUTO", "Automobile", 5122.00, 5260.00, 2.62, 71, ["uptrend", "up 4% in 5 days"]),
 ]
 TRADES = [
     {"id": "t1", "symbol": "QUARTZTECH", "breakout_date": "2026-10-20", "R": 1872.0, "retest_date": "2026-10-23",

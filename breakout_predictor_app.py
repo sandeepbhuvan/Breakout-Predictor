@@ -69,9 +69,12 @@ HORIZON = 7                   # prediction window in sessions
 QUOTE_BATCH = 200             # Upstox allows up to 500 keys per quote call
 HISTORY_REQ_PER_SEC = 6       # stays under Upstox's 500 requests/minute limit
 
+SCORE_VERSION = 2  # bump when the score changes meaning; resets min_score to the new default
+
 DEFAULT_CONFIG = {
+    "score_version": SCORE_VERSION,
     "close_to_tray": True,
-    "min_score": 65,
+    "min_score": 70,
     "max_dist_pct": 3.0,
     "min_price": 20.0,
     "nifty_csv_path": "",
@@ -133,7 +136,14 @@ def write_json(path, data):
 
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
-    cfg.update(read_json(APP_DIR / "config.json", {}) or {})
+    saved = read_json(APP_DIR / "config.json", {}) or {}
+    cfg.update(saved)
+    if saved and saved.get("score_version") != SCORE_VERSION:
+        # The score was rebuilt, so an old threshold means something else now: start from the new default.
+        cfg["min_score"] = DEFAULT_CONFIG["min_score"]
+        cfg["score_version"] = SCORE_VERSION
+        save_config(cfg)
+        cfg["_score_migrated"] = True
     return cfg
 
 
@@ -180,47 +190,69 @@ def compute_series(stock):
     tr = [h[0] - l[0]] + [max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1])) for i in range(1, len(c))]
     sma20, std20 = rolling_mean(c, 20), rolling_std(c, 20)
     bw = [None if m is None or not m else 4 * s / m for m, s in zip(sma20, std20)]
-    return {**stock, "sma20": sma20, "sma50": rolling_mean(c, 50), "bw": bw,
+    return {**stock, "sma20": sma20, "sma50": rolling_mean(c, 50), "sma100": rolling_mean(c, 100), "bw": bw,
             "atr5": rolling_mean(tr, 5), "atr20": rolling_mean(tr, 20)}
 
 
-def setup_components(S, t):
-    """Price-independent part of the score (max 80), using bars up to and including index t."""
-    h, l, c, v = S["h"], S["l"], S["c"], S["v"]
+RS_LOOKBACK = 60  # sessions for relative strength
+
+
+def ret60(S, t):
+    """60-session return at bar t, or None without enough history."""
+    c = S["c"]
+    return c[t] / c[t - RS_LOOKBACK] - 1 if t >= RS_LOOKBACK and c[t - RS_LOOKBACK] else None
+
+
+def rs_percentile(sorted_returns, r):
+    """Where a 60-session return ranks among every stock's on the same day (0 = weakest, 1 = strongest)."""
+    if r is None or not sorted_returns:
+        return None
+    return bisect.bisect_left(sorted_returns, r) / len(sorted_returns)
+
+
+def setup_components(S, t, rs):
+    """Score parts that don't depend on the distance to R (max 80), using bars up to and including index t.
+
+    Score v2 (see README): relative strength 25, 5-day momentum 20, trend 15, near 1-year high 10,
+    accumulation 10, plus proximity 20 from proximity(). rs = rs_percentile() of this stock's 60-session return
+    against all stocks on the same day (None counts as 0)."""
+    h, c, v = S["h"], S["c"], S["v"]
     R = max(h[t - 19:t + 1])
-
-    atr_ratio = S["atr5"][t] / S["atr20"][t] if S["atr20"][t] else 1.0
-    contraction = clamp((1.0 - atr_ratio) / 0.4)
-
-    window = [x for x in S["bw"][t - 39:t + 1] if x is not None]
-    squeeze = 1.0 - sum(1 for x in window if x < S["bw"][t]) / len(window) if window and S["bw"][t] else 0.0
-
-    rising = 1.0 if min(l[t - 4:t + 1]) > min(l[t - 14:t - 4]) else 0.0
-
+    rs = rs or 0.0
+    mom5 = (c[t] / c[t - 5] - 1) * 100 if c[t - 5] else 0.0
+    sma50, sma100 = S["sma50"][t], S["sma100"][t]
+    trend = 0.5 * bool(sma50 and c[t] > sma50 and S["sma20"][t] > sma50) + 0.5 * bool(sma100 and c[t] > sma100)
+    near_high = c[t] / max(h[max(0, t - 249):t + 1])
     up = sum(v[i] for i in range(t - 14, t + 1) if c[i] > c[i - 1])
     dn = sum(v[i] for i in range(t - 14, t + 1) if c[i] < c[i - 1])
-    accum = clamp((up / max(dn, 1) - 0.8) / 0.8)
+    accum = clamp((up / max(dn, 1) - 0.8) / 1.6)
 
-    trend = 0.5 * (c[t] > S["sma50"][t]) + 0.5 * (S["sma20"][t] > S["sma50"][t])
-
-    tests = sum(1 for i in range(t - 19, t + 1) if h[i] >= R * 0.985)
-    tests_score = clamp((tests - 1) / 3)
-
-    base = 15 * contraction + 15 * squeeze + 15 * rising + 15 * accum + 10 * trend + 10 * tests_score
+    base = (25 * rs + 20 * clamp(mom5 / 8) + 15 * trend + 10 * clamp((near_high - 0.85) / 0.15) + 10 * accum)
     reasons = []
-    if contraction >= 0.5:
-        reasons.append("range contracting")
-    if squeeze >= 0.75:
-        reasons.append("BB squeeze")
-    if rising:
-        reasons.append("higher lows")
-    if accum >= 0.5:
-        reasons.append("accumulation")
+    if rs >= 0.8:
+        reasons.append(f"stronger than {rs * 100:.0f}% of stocks")
+    if mom5 >= 4:
+        reasons.append(f"up {mom5:.0f}% in 5 days")
     if trend == 1:
         reasons.append("uptrend")
-    if tests >= 3:
-        reasons.append(f"R tested {tests}x")
+    if near_high >= 0.97:
+        reasons.append("near 1-year high")
+    if accum >= 0.5:
+        reasons.append("accumulation")
     return {"R": R, "base": base, "reasons": reasons}
+
+
+def returns_by_date(series):
+    """{date: sorted 60-session returns of every stock that day}, for rs_percentile in the backtest."""
+    out = {}
+    for S in series.values():
+        for t in range(RS_LOOKBACK, len(S["c"])):
+            r = ret60(S, t)
+            if r is not None:
+                out.setdefault(S["d"][t], []).append(r)
+    for v in out.values():
+        v.sort()
+    return out
 
 
 def proximity(R, price, max_dist):
@@ -315,20 +347,19 @@ def backtest(history, cfg, stop_event=None, weekly=None):
     split = {"above": [0, 0], "below": [0, 0], "no data": [0, 0]}
     target_pct = float(cfg.get("target_pct") or 10)
     trades, baseline_trades = [], []
-    for key_, stock in history.items():
+    all_series = {k: compute_series(st_) for k, st_ in history.items() if len(st_["c"]) >= MIN_BARS + HORIZON + 1}
+    rs_by_date = returns_by_date(all_series)
+    for key_, S in all_series.items():
         if stop_event and stop_event.is_set():
             break
-        n = len(stock["c"])
-        if n < MIN_BARS + HORIZON + 1:
-            continue
-        S = compute_series(stock)
+        n = len(S["c"])
         c = S["c"]
         w = weekly.get(key_) if weekly else None
         seen_breakouts = set()
-        for t in range(MIN_BARS - 1, n - HORIZON):
+        for t in range(max(MIN_BARS - 1, RS_LOOKBACK), n - HORIZON):
             if c[t] < min_price:
                 continue
-            comp = setup_components(S, t)
+            comp = setup_components(S, t, rs_percentile(rs_by_date.get(S["d"][t]), ret60(S, t)))
             prox = proximity(comp["R"], c[t], max_dist)
             if not prox:
                 continue
@@ -1271,17 +1302,17 @@ class Engine(threading.Thread):
         self.key_by_symbol = {s["symbol"]: k for k, s in self.history.items()}
         self.events.put(("stats", prediction_stats(preds)))
 
+        # Scores are computed each scan from the completed bars plus today's live bar (see scan_once).
         self.setups = {}
         for key, stock in self.history.items():
-            S = compute_series(stock)
-            t = len(S["c"]) - 1
-            comp = setup_components(S, t)
-            comp.update(symbol=stock["symbol"], industry=stock["industry"], prev_close=S["c"][t])
+            if len(stock["c"]) < max(MIN_BARS, RS_LOOKBACK + 1):
+                continue
+            info = {"symbol": stock["symbol"], "industry": stock["industry"], "stock": stock}
             if self.weekly is not None:
-                comp["wma200"] = wma200_at(self.weekly.get(key), today_str())
-            self.setups[key] = comp
+                info["wma200"] = wma200_at(self.weekly.get(key), today_str())
+            self.setups[key] = info
         self.prepared_for = today_str()
-        self.log(f"Setups computed for {len(self.setups)} stocks from completed sessions.")
+        self.log(f"Ready to score {len(self.setups)} stocks.")
 
     def loop(self):
         self.log("Live predictor started.")
@@ -1326,6 +1357,26 @@ class Engine(threading.Thread):
         self.events.put(("prices", prices))
         thr, max_dist, min_price = float(self.cfg["min_score"]), float(self.cfg["max_dist_pct"]), float(self.cfg["min_price"])
 
+        # Today's bar from the quote (replacing a stored bar for today, if any), so the live score is computed
+        # exactly like the backtest's: on the session's bar, with relative strength ranked across all stocks.
+        live_bars, live_ret = {}, []
+        for key, s in self.setups.items():
+            q = quotes.get(key)
+            if not q or not q.get("last_price"):
+                continue
+            stock, ltp = s["stock"], float(q["last_price"])
+            ohlc = q.get("ohlc") or {}
+            same_day = stock["d"][-1] == (trade_date(q) or today_str(t))
+            keep = len(stock["c"]) - (1 if same_day else 0)
+            bar = {"d": trade_date(q) or today_str(t), "o": float(ohlc.get("open") or ltp),
+                   "h": max(float(ohlc.get("high") or ltp), ltp), "l": min(float(ohlc.get("low") or ltp), ltp),
+                   "c": ltp, "v": float(q.get("volume") or 0)}
+            live_bars[key] = (keep, bar)
+            base_close = stock["c"][keep - RS_LOOKBACK] if keep >= RS_LOOKBACK else None
+            if base_close:
+                live_ret.append(ltp / base_close - 1)
+        live_ret.sort()
+
         rows, stale = [], 0
         for key, s in self.setups.items():
             q = quotes.get(key)
@@ -1339,11 +1390,19 @@ class Engine(threading.Thread):
             if td and td != today_str(t):
                 stale += 1
             ltp = float(q["last_price"])
-            if ltp < min_price:
+            if ltp < min_price or key not in live_bars:
                 continue
-            prox = proximity(s["R"], ltp, max_dist)
+            keep, bar = live_bars[key]
+            stock = s["stock"]
+            if max(stock["h"][keep - 19:keep] + [bar["h"]]) > ltp * (1 + max_dist / 100):
+                continue  # too far below the 20-day high: skip the full scoring
+            S = compute_series({**stock, **{f: stock[f][:keep] + [bar[f]] for f in ("d", "o", "h", "l", "c", "v")}})
+            tt = len(S["c"]) - 1
+            comp = setup_components(S, tt, rs_percentile(live_ret, ret60(S, tt)))
+            prox = proximity(comp["R"], ltp, max_dist)
             if not prox:
                 continue
+            s = {**s, **comp}
             reasons = s["reasons"]
             if self.weekly is not None:
                 if not s.get("wma200") or ltp <= s["wma200"]:
@@ -1373,7 +1432,7 @@ class Engine(threading.Thread):
 
         for r in fresh:
             preds.append({"date": today_str(t), "time": f"{t:%H:%M}", "symbol": r["symbol"], "R": r["R"],
-                          "price": r["ltp"], "score": round(r["score"], 1), "status": "open"})
+                          "price": r["ltp"], "score": round(r["score"], 1), "status": "open", "v": SCORE_VERSION})
         save_predictions(preds)
         stats = prediction_stats(preds)
         self.events.put(("stats", stats))
@@ -1710,6 +1769,9 @@ class App(tk.Tk):
         self._set_pill("idle")
         self._update_account_ui()
         self.after(200, self._drain_events)
+        if self.cfg.pop("_score_migrated", False):
+            self._log(f"The setup score was rebuilt (v{SCORE_VERSION}): relative strength and momentum replace squeeze "
+                      f"and resistance tests. Min setup score reset to {DEFAULT_CONFIG['min_score']:g}.")
         if ACCOUNT.configured and (APP_DIR / "session.json").exists():
             self.sync_label.configure(text="Signing in…")
             def resume():
@@ -2470,7 +2532,7 @@ class App(tk.Tk):
               "Connection. It stays in memory only and is never saved or uploaded."),
         ("img", "connection.png"),
         ("h2", "2.  Set your rules"),
-        ("p", "Min setup score: how strict the predictions are (65 is a good start). Max % below 20D high: how close "
+        ("p", "Min setup score: how strict the predictions are (70 keeps about the top quarter). Max % below 20D high: how close "
               "to the breakout level a stock must be. Min price: skips penny stocks. Buy-in profit target %: the "
               "target for buy-ins (10% by default). Tick the 200-week MA box to keep only long-term uptrends."),
         ("img", "rules.png"),
@@ -2790,6 +2852,10 @@ class App(tk.Tk):
         win.grab_set()
 
     def _apply_settings(self, remote):
+        remote = dict(remote)
+        if remote.get("score_version") != SCORE_VERSION:  # saved under the old score: its threshold doesn't apply
+            remote.pop("min_score", None)
+            remote.pop("score_version", None)
         for k, v in remote.items():
             if k in self.vars:
                 self.vars[k].set(str(v))

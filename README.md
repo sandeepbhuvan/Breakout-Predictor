@@ -22,7 +22,7 @@ Upstox developer console → **My Apps → Analytics token** (read-only, valid f
 
 ### 2. Set your rules
 
-- **Min setup score**: how strict predictions are (65 is a good start).
+- **Min setup score**: how strict predictions are (70 keeps about the top quarter of candidates).
 - **Max % below 20D high**: how close to the breakout level a stock must be.
 - **Min price**: skips penny stocks.
 - **Buy-in profit target %**: target for buy-ins (10% by default).
@@ -165,13 +165,18 @@ into above / below the 200-week MA, so you can check whether the filter helps be
 
 | Points | Signal | Meaning |
 | --- | --- | --- |
+| 25 | Relative strength | The stock's 60-session return, ranked against every Nifty 500 stock that day |
 | 20 | Proximity | Price is close to (but still below) the 20-day high |
-| 15 | Contraction | 5-day ATR shrinking vs 20-day ATR |
-| 15 | Squeeze | Bollinger bandwidth near its 40-day low |
-| 15 | Higher lows | Recent lows rising into resistance |
-| 15 | Accumulation | More volume on up days than down days |
-| 10 | Trend | Close above 50-day SMA, 20-day SMA above 50-day SMA |
-| 10 | Resistance tests | The level has been touched several times |
+| 20 | Momentum | 5-day gain (full points at +8%) |
+| 15 | Trend | Above its 50-day average (with the 20-day above the 50-day) and above its 100-day average |
+| 10 | Near 1-year high | Close within 15% of the highest high of the past year (full points at the high) |
+| 10 | Accumulation | More volume on up days than down days over 15 sessions |
+
+This is score version 2 (November 2026). A year of backtesting showed that the old score's Bollinger squeeze and
+resistance-test points did worse than nothing, while relative strength and recent momentum helped in both halves of
+the year. The new score ranks breakouts much better: its top fifth broke out 16–24 points more often than its bottom
+fifth. It hasn't yet been shown to make the buy-ins profitable. Predictions logged from now on carry the score version,
+so the Track record will show how it does on fresh data. Updating resets **Min setup score** once to the new default.
 
 **Run backtest** replays these exact rules over the past year and compares them with a baseline (every stock
 near its 20-day high). Judge the threshold by the *lift* over that baseline, not the raw hit rate. These are
