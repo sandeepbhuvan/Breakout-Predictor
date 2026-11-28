@@ -69,7 +69,7 @@ Changing the scoring changes all three.
   closes per ISO week for the 200-week SMA filter, which uses completed weeks only.
 - `grade_predictions` resolves old predictions: a hit is a close > R within `HORIZON` sessions.
 - `build_trades` rebuilds every buy-in from completed candles with `simulate_trade` (constants `RETEST_*`, `ENTRY_*`,
-  `MAX_HOLD`, `STOP_BUFFER`; a day that touches both stop and target counts as the stop; gaps fill at the open). The
+  `MAX_HOLD`, `STOP_BUFFER`; each record stores its `stop_buffer`, and an entered trade keeps its own; a day that touches both stop and target counts as the stop; gaps fill at the open). The
   rebuild is the official record.
 - `check_trades_live` only sends intraday alerts. Its `alert_*` flags must survive rebuilds.
 

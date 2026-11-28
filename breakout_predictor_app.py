@@ -273,7 +273,8 @@ FAIL_BELOW = 0.03      # a close 3%+ below the ceiling = failed breakout
 RETEST_WINDOW = 10     # sessions after the breakout to wait for a retest
 ENTRY_WINDOW = 5       # sessions after the latest retest touch to wait for the bounce
 MAX_HOLD = 30          # sessions to hold a buy-in before calling it expired
-STOP_BUFFER = 0.01     # stop sits 1% below the retest day's low
+STOP_BUFFER = 0.05     # stop sits 5% below the retest day's low (1% stopped out ~70% of buy-ins on noise)
+LEGACY_STOP_BUFFER = 0.01  # buy-ins already in a trade when the stop was widened keep their 1% stop
 
 TRADE_CLOSED = ("win", "loss", "expired", "failed", "no_retest", "no_entry")
 TRADE_LABELS = {"waiting_retest": "Waiting for retest", "retesting": "Retesting", "entered": "In trade",
@@ -296,12 +297,14 @@ def simulate_exit(S, entry_idx, entry, stop, target, n):
     return None
 
 
-def simulate_trade(S, b, R, target_pct, n=None):
-    """Follow a breakout (close > R at index b) through retest, bounce entry and exit, using daily bars < n."""
+def simulate_trade(S, b, R, target_pct, n=None, stop_buffer=None):
+    """Follow a breakout (close > R at index b) through retest, bounce entry and exit, using daily bars < n.
+    stop_buffer: how far below the retest day's low the stop sits (default STOP_BUFFER)."""
     n = len(S["c"]) if n is None else n
+    sb = STOP_BUFFER if stop_buffer is None else stop_buffer
     h, l, c, d = S["h"], S["l"], S["c"], S["d"]
     o = S.get("o")
-    st = {"breakout_date": d[b], "R": R, "breakout_close": c[b], "status": "waiting_retest"}
+    st = {"breakout_date": d[b], "R": R, "breakout_close": c[b], "status": "waiting_retest", "stop_buffer": sb}
     retest = None
     for i in range(b + 1, n):
         if c[i] < R * (1 - FAIL_BELOW):
@@ -310,7 +313,7 @@ def simulate_trade(S, b, R, target_pct, n=None):
         if retest is not None and h[i] > h[retest]:
             trigger = h[retest]
             entry = max(o[i], trigger) if o else trigger
-            stop = l[retest] * (1 - STOP_BUFFER)
+            stop = l[retest] * (1 - sb)
             target = entry * (1 + target_pct / 100)
             st.update(status="entered", entry_date=d[i], entry_price=round(entry, 2), stop=round(stop, 2),
                       target=round(target, 2))
@@ -324,7 +327,7 @@ def simulate_trade(S, b, R, target_pct, n=None):
         if l[i] <= R * (1 + RETEST_TOL) and c[i] >= R * (1 - HOLD_BELOW):
             retest = i
             st.update(status="retesting", retest_date=d[i], retest_low=l[i], retest_high=h[i],
-                      buy_above=round(h[i], 2), stop=round(l[i] * (1 - STOP_BUFFER), 2))
+                      buy_above=round(h[i], 2), stop=round(l[i] * (1 - sb), 2))
             continue
         if retest is None and i - b >= RETEST_WINDOW:
             st.update(status="no_retest", closed_date=d[i])
@@ -406,7 +409,7 @@ def backtest(history, cfg, stop_event=None, weekly=None):
     retested = sum(1 for t in trades if t.get("retest_date"))
     lines += ["",
               f"Buy-ins: breakout, retest, then a move above the retest day's high "
-              f"(target +{target_pct:g}%, stop 1% below the retest low, max {MAX_HOLD} sessions)",
+              f"(target +{target_pct:g}%, stop {STOP_BUFFER * 100:g}% below the retest low, max {MAX_HOLD} sessions)",
               f"  Predicted breakouts: {len(trades):,}  |  retested: "
               f"{retested / len(trades) * 100 if trades else 0:.0f}%  |  buy-ins: {summary['entries']:,} "
               f"(closed: {summary['closed']:,})",
@@ -786,7 +789,11 @@ def build_trades(preds, history, existing, target_pct):
                 out.append(prev)
             continue
         else:
-            t = simulate_trade(s, s["d"].index(p["resolved"]), p["R"], target_pct)
+            # A buy-in already in a trade keeps the stop it was entered with; anything not yet bought uses the
+            # current STOP_BUFFER (records from before stops were stored were entered with the 1% stop).
+            sb = (prev.get("stop_buffer", LEGACY_STOP_BUFFER) if prev and prev.get("status") == "entered"
+                  else STOP_BUFFER)
+            t = simulate_trade(s, s["d"].index(p["resolved"]), p["R"], target_pct, stop_buffer=sb)
             t.update(id=tid, symbol=p["symbol"], predicted=p["date"])
             if prev:
                 for k, v in prev.items():
@@ -1216,7 +1223,7 @@ def trade_alert_html(events, when, cfg):
             f"<table style='border-collapse:collapse;font-size:14px'><thead><tr style='background:#f4f6f8'>{head}"
             f"</tr></thead><tbody>{body}</tbody></table>"
             f"<p style='color:#666'><b>BUY-IN</b>: a predicted breakout came back to retest its old ceiling and has now "
-            f"moved above the retest day's high. Stop is 1% below the retest low; target is "
+            f"moved above the retest day's high. Stop is {STOP_BUFFER * 100:g}% below the retest low; target is "
             f"+{float(cfg.get('target_pct') or 10):g}% from entry. Probabilistic signals, not investment advice.</p></div>")
 
 
@@ -2392,8 +2399,8 @@ class App(tk.Tk):
             self.tab_hint.pack(side="right")
         self.tab_hint.configure(text={
             "live": "highlighted rows are new  ·  sorted by score",
-            "buyins": "predicted breakout → retest → buy above the retest day's high  ·  stop 1% under "
-                      "the retest low",
+            "buyins": "predicted breakout → retest → buy above the retest day's high  ·  stop "
+                      f"{STOP_BUFFER * 100:g}% under the retest low",
             "track": f"hit = a close above the breakout level within {HORIZON} sessions  ·  newest first"}[name])
         if name == "track":
             self._refresh_track()

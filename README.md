@@ -135,8 +135,8 @@ through:
    1.5% above it and whose close stays no more than 1% below it. A close 3%+ below the ceiling = *failed breakout*.
 2. **Retesting** – the buy trigger is the retest day's high. Each new retest touch resets it. No move above it within
    5 sessions = *no bounce*.
-3. **In trade** – entry when price goes above the retest day's high (at the open if it gaps above). Stop 1% below the
-   retest day's low; target **+10%** (setting *Buy-in profit target %*).
+3. **In trade** – entry when price goes above the retest day's high (at the open if it gaps above). Stop 5% below the
+   retest day's low (trades entered before Nov 2026 keep their original 1% stop); target **+10%** (setting *Buy-in profit target %*).
 4. **Result** – *target hit* or *stopped out* (if a single day touches both, it counts as stopped out), or *expired*
    after 30 sessions at that day's close.
 
