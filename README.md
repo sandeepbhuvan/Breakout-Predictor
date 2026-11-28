@@ -116,9 +116,13 @@ Then tick **Analyse news for setups**.
 - **Double-click** a Live setups row to read the headlines and Gemini's one-line summaries.
 - **Skip setups with negative news** (optional) hides setups scoring −0.25 or lower and doesn't log or email them.
 - One Gemini call per sector per day covers all of that sector's setups, and results are cached for the day, so
-  the free tier is plenty. The default model is `gemini-3.5-flash-lite`, which you can change in the same dialog.
-- The key is kept in memory only, like the Upstox token. To skip pasting it at every start, set it as the
-  `GEMINI_API_KEY` environment variable: `setx GEMINI_API_KEY "your-key"`, then restart the app.
+  the free tier is plenty.
+- **Model:** *auto* (the default) tries the best free model first, `gemini-4-hydrogen`, then `gemini-3.8-flash`,
+  then `gemini-3.5-flash-lite`. It uses the first one your key is allowed and has quota for, and the log says which.
+  You can type a specific model name instead.
+- **The key:** tick *Remember the key on this PC* (on by default) and you paste it once. It's saved in
+  `~/.breakout_predictor/gemini.key`, encrypted with Windows DPAPI, so only your Windows account on this PC can read
+  it. It's never synced. Untick the box and Save to forget it. The `GEMINI_API_KEY` environment variable also works.
 - Only public headlines are sent to Gemini. On the free tier, Google may use requests to improve its products.
 - News is **not** part of the setup score: there's no news history to backtest it against. Each prediction saves
   its news value, so the track record can show over time whether it helps.
@@ -263,7 +267,9 @@ To point a copy at another project, create `firebase_config.json` next to the ap
 
 ## Privacy
 
-The Upstox token, SMTP password and Gemini API key are kept in memory only and are never written to disk. They can be prefilled
+The Upstox token and SMTP password are kept in memory only and are never written to disk. The Gemini API key
+too, unless you tick *Remember the key on this PC*: then it's stored encrypted with Windows DPAPI (readable only by
+your Windows account) and never synced. They can be prefilled
 from the environment variables `UPSTOX_ACCESS_TOKEN`, `HHLL_SMTP_PASSWORD` and `GEMINI_API_KEY`. With news
 sentiment on, setup stocks' company and sector names go to Google News, and their headlines go to Gemini. Settings, cached history and the
 prediction log live in `~/.breakout_predictor` (per account under `users/<uid>` when signed in). When signed in,

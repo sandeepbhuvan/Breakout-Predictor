@@ -89,7 +89,7 @@ DEFAULT_CONFIG = {
     "target_pct": 10.0,
     "news_enabled": False,
     "news_filter": False,
-    "gemini_model": "gemini-3.5-flash-lite",
+    "gemini_model": "auto",
     "pnl_mode": "pct",
     "trade_amount": 100000,
 }
@@ -143,6 +143,8 @@ def load_config():
     cfg = dict(DEFAULT_CONFIG)
     saved = read_json(APP_DIR / "config.json", {}) or {}
     cfg.update(saved)
+    if cfg.get("gemini_model") == "gemini-3.5-flash-lite":  # the old default, never chosen by hand: use auto
+        cfg["gemini_model"] = "auto"
     if saved and saved.get("score_version") != SCORE_VERSION:
         # The score was rebuilt, so an old threshold means something else now: start from the new default.
         cfg["min_score"] = DEFAULT_CONFIG["min_score"]
@@ -1177,7 +1179,9 @@ class CloudAccount:
 
 # =========================================================================== news + sentiment (Google News + Gemini)
 GEMINI_API = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-GEMINI_DEFAULT_MODEL = "gemini-3.5-flash-lite"  # cheapest free-tier model (Nov 2026); editable in News settings
+# "auto" tries the free-tier models best-first (Nov 2026 lineup) and uses the first one the key can call today.
+GEMINI_AUTO_MODELS = ["gemini-4-hydrogen", "gemini-3.8-flash", "gemini-3.5-flash-lite"]
+GEMINI_DEFAULT_MODEL = "auto"
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search"
 NEWS_DAYS = 2           # headlines from the last N days
 NEWS_PER_QUERY = 8      # headlines per stock / sector sent to Gemini
@@ -1187,7 +1191,30 @@ POS_NEWS = 0.25
 
 
 class GeminiError(Exception):
-    pass
+    def __init__(self, msg, code=None):
+        super().__init__(msg)
+        self.code = code  # HTTP status, when there was one
+
+
+def gemini_models(setting):
+    """The model(s) to try for a News setting: the auto list, or exactly the one the user typed."""
+    setting = (setting or "").strip()
+    return list(GEMINI_AUTO_MODELS) if setting.lower() in ("", "auto") else [setting]
+
+
+def gemini_json_any(api_key, models, prompt, timeout=90):
+    """gemini_json over a list of models: returns (result, model used). A model the key can't use (not found,
+    not allowed, out of free quota) quickly falls through to the next; the last one gets the full retries."""
+    last = None
+    for i, model in enumerate(models):
+        final = i == len(models) - 1
+        try:
+            return gemini_json(api_key, model, prompt, timeout, retries=3 if final else 0), model
+        except GeminiError as e:
+            last = e
+            if e.code in (401,) or final:  # a bad key fails the same on every model
+                raise
+    raise last
 
 
 def google_news(query, days=NEWS_DAYS, limit=NEWS_PER_QUERY):
@@ -1204,12 +1231,12 @@ def google_news(query, days=NEWS_DAYS, limit=NEWS_PER_QUERY):
     return out
 
 
-def gemini_json(api_key, model, prompt, timeout=90):
+def gemini_json(api_key, model, prompt, timeout=90, retries=3):
     """Call Gemini generateContent asking for JSON; returns the parsed object. Retries rate limits / overload."""
     body = json.dumps({"contents": [{"role": "user", "parts": [{"text": prompt}]}],
                        "generationConfig": {"responseMimeType": "application/json"}}).encode()
     url = GEMINI_API.format(model=urllib.parse.quote(model, safe="-._"))
-    for attempt in range(4):
+    for attempt in range(retries + 1):
         req = urllib.request.Request(url, data=body, method="POST", headers={
             "Content-Type": "application/json", "x-goog-api-key": api_key, "User-Agent": APP_USER_AGENT})
         try:
@@ -1218,14 +1245,14 @@ def gemini_json(api_key, model, prompt, timeout=90):
             break
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")[:300]
-            if e.code in (429, 500, 503) and attempt < 3:
+            if e.code in (429, 500, 503) and attempt < retries:
                 time.sleep(5 * 3 ** attempt)  # 5s, 15s, 45s
                 continue
             hint = {400: "bad request (check the model name)", 401: "API key not valid", 403: "API key not allowed",
                     404: "model not found (check the model name)", 429: "free-tier limit reached for now"}.get(e.code, "")
-            raise GeminiError(f"Gemini HTTP {e.code} {hint}: {detail}") from None
+            raise GeminiError(f"Gemini HTTP {e.code} {hint} ({model}): {detail}", e.code) from None
         except (urllib.error.URLError, TimeoutError) as e:
-            if attempt < 3:
+            if attempt < retries:
                 time.sleep(5)
                 continue
             raise GeminiError(f"Gemini unreachable: {e}") from None
@@ -1280,7 +1307,8 @@ class NewsDesk:
     only a handful of calls. Only public headlines are sent to Gemini."""
 
     def __init__(self, api_key, model, log):
-        self.api_key, self.model, self.log = api_key, (model or GEMINI_DEFAULT_MODEL).strip(), log
+        self.api_key, self.models, self.log = api_key, gemini_models(model), log
+        self.model_used = None
         self.failed_on = None  # date Gemini failed (bad key, quota): stop retrying that day, don't block setups
 
     @staticmethod
@@ -1318,7 +1346,11 @@ class NewsDesk:
                 news = [h for h in news if mentions(h["title"], sym, company)][:NEWS_PER_QUERY]
                 stocks.append((sym, company or sym, news))
             try:
-                out = gemini_json(self.api_key, self.model, sentiment_prompt(industry, sector_news, stocks))
+                out, model = gemini_json_any(self.api_key, self.models, sentiment_prompt(industry, sector_news, stocks))
+                if model != self.model_used:
+                    self.model_used = model
+                    self.log(f"News: using {model}")
+                    self.models = self.models[self.models.index(model):]  # don't retry worse-off models today
             except GeminiError as e:
                 self.failed_on = today_str()
                 self.log(f"News sentiment paused for today: {e}")
@@ -1922,6 +1954,48 @@ class Tray(threading.Thread):
         return False
 
 
+SECRET_FILE = "{name}.key"  # in APP_DIR, encrypted with Windows DPAPI: readable only by this Windows user here
+
+
+def _dpapi(data, protect):
+    """Encrypt / decrypt bytes with Windows DPAPI (CryptProtectData), bound to the current Windows user."""
+    import ctypes
+    from ctypes import wintypes
+
+    class BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+    crypt32, kernel32 = ctypes.windll.crypt32, ctypes.windll.kernel32
+    buf = ctypes.create_string_buffer(data, len(data))
+    src, out = BLOB(len(data), buf), BLOB()
+    fn = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    fn.argtypes = [ctypes.POINTER(BLOB), wintypes.LPCWSTR, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                   wintypes.DWORD, ctypes.POINTER(BLOB)]
+    if not fn(ctypes.byref(src), "Breakout Predictor" if protect else None, None, None, None, 0x1, ctypes.byref(out)):
+        raise OSError("Windows could not " + ("encrypt" if protect else "decrypt") + " the saved key")
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        kernel32.LocalFree(out.pbData)
+
+
+def save_secret(name, value):
+    """Remember a secret on this PC (DPAPI-encrypted file; never synced). An empty value forgets it."""
+    path = APP_DIR / SECRET_FILE.format(name=name)
+    if not value:
+        path.unlink(missing_ok=True)
+        return
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(_dpapi(value.encode("utf-8"), True))
+
+
+def load_secret(name):
+    path = APP_DIR / SECRET_FILE.format(name=name)
+    try:
+        return _dpapi(path.read_bytes(), False).decode("utf-8") if path.exists() else ""
+    except Exception:  # noqa: BLE001 - another Windows user's file, or corrupted: just ask again
+        return ""
+
+
 def windows_setup():
     try:
         import ctypes
@@ -1962,7 +2036,7 @@ class App(tk.Tk):
         self.row_count = None
         self.live_prices = {}
         self.smtp_pw_var = tk.StringVar(value=os.environ.get("HHLL_SMTP_PASSWORD", ""))
-        self.gemini_key_var = tk.StringVar(value=os.environ.get("GEMINI_API_KEY", ""))
+        self.gemini_key_var = tk.StringVar(value=os.environ.get("GEMINI_API_KEY", "") or load_secret("gemini"))
         global ACCOUNT
         ACCOUNT = CloudAccount(notify=lambda kind, payload: self.events.put(("cloud", kind, payload)))
         self._style()
@@ -2674,17 +2748,20 @@ class App(tk.Tk):
                           "Gemini to rate them from -1 (negative) to +1 (positive): 70% the stock's news, 30% its\n"
                           "sector's. Shown in the NEWS column; double-click a row to read the headlines.",
                   style="Hint.TLabel", justify="left").pack(anchor="w", pady=(0, 12))
-        self._field(c, "Gemini API key (free at aistudio.google.com; kept in memory only)", var=self.gemini_key_var,
-                    show="•", width=48)
+        self._field(c, "Gemini API key (free at aistudio.google.com)", var=self.gemini_key_var, show="•", width=48)
+        remember_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(c, text="Remember the key on this PC (encrypted for your Windows account, never synced)",
+                        variable=remember_var, style="Card.TCheckbutton").pack(anchor="w", pady=(0, 12))
         model_var = tk.StringVar(value=self.cfg.get("gemini_model") or GEMINI_DEFAULT_MODEL)
-        self._field(c, "Gemini model", var=model_var, width=48)
+        self._field(c, f"Gemini model  (auto = best free model available: {', '.join(GEMINI_AUTO_MODELS)})",
+                    var=model_var, width=48)
         on_var = tk.BooleanVar(value=bool(self.cfg.get("news_enabled")))
         filter_var = tk.BooleanVar(value=bool(self.cfg.get("news_filter")))
         ttk.Checkbutton(c, text="Analyse news for setups", variable=on_var, style="Card.TCheckbutton").pack(
             anchor="w", pady=(0, 6))
         ttk.Checkbutton(c, text=f"Skip setups with negative news (score {NEG_NEWS:+.2f} or lower)", variable=filter_var,
                         style="Card.TCheckbutton").pack(anchor="w")
-        ttk.Label(c, text="Only public headlines are sent. On Gemini's free tier Google may use requests to improve its\n"
+        ttk.Label(c, text="Only public headlines are sent. On Gemini's free tier, Google may use requests to improve its\n"
                           "products. News isn't part of the setup score: there is no news history to backtest it.",
                   style="Hint.TLabel", justify="left").pack(anchor="w", pady=(12, 0))
         status = ttk.Label(c, text="", style="Hint.TLabel")
@@ -2701,8 +2778,8 @@ class App(tk.Tk):
 
             def work():
                 try:
-                    out = gemini_json(key, model, 'Reply with JSON only: {"ok": true}', timeout=30)
-                    msg = ("Gemini works." if out.get("ok") else "Gemini replied, but unexpectedly."), P["green"]
+                    out, used = gemini_json_any(key, gemini_models(model), 'Reply with JSON only: {"ok": true}', 30)
+                    msg = (f"Gemini works ({used})." if out.get("ok") else f"{used} replied, but unexpectedly."), P["green"]
                 except GeminiError as e:
                     msg = str(e)[:160], P["red"]
                 self.events.put(("call", lambda: status.winfo_exists() and status.configure(text=msg[0], foreground=msg[1])))
@@ -2711,6 +2788,10 @@ class App(tk.Tk):
         def save():
             self.cfg.update(news_enabled=bool(on_var.get()), news_filter=bool(filter_var.get()),
                             gemini_model=model_var.get().strip() or GEMINI_DEFAULT_MODEL)
+            try:
+                save_secret("gemini", self.gemini_key_var.get().strip() if remember_var.get() else "")
+            except OSError as e:
+                messagebox.showerror("News", f"Couldn't remember the key: {e}")
             if self._collect():
                 self._update_news_btn()
                 if self.engine and self.engine.is_alive():

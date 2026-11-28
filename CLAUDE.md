@@ -19,8 +19,10 @@ table, buy-in rules, emails, accounts, privacy.
 - **Python standard library only.** No pip dependencies: Tkinter, urllib, smtplib, ctypes, zlib. Firebase is called
   over REST, not the SDK. The tray icon and screenshot capture are raw Win32 through ctypes. Keep it that way.
 - On this machine `python` is a broken WindowsApps alias. Use `py` (or `pyw` for no console). Python 3.14.
-- The Upstox token, SMTP password and Gemini API key live in memory only. They are never written to disk or sent to
-  Firebase. They can be prefilled from `UPSTOX_ACCESS_TOKEN`, `HHLL_SMTP_PASSWORD` and `GEMINI_API_KEY`.
+- The Upstox token and SMTP password live in memory only. They are never written to disk or sent to Firebase, and can
+  be prefilled from `UPSTOX_ACCESS_TOKEN` and `HHLL_SMTP_PASSWORD`. The Gemini key can also come from `GEMINI_API_KEY`,
+  or, if the owner opts in, from `save_secret`/`load_secret` (a Windows DPAPI-encrypted `APP_DIR/gemini.key`). It is
+  never synced or written in plain text.
 - `legacy/` (the original Apps Script, which contains a third party's email) and `firebase_config.json` are git-ignored
   and must stay out of commits.
 - Upstox calls must send `APP_USER_AGENT`. Without it, Cloudflare returns 403 / error 1010.
@@ -80,8 +82,8 @@ Changing the scoring changes all three.
 
 **News sentiment.**
 - `NewsDesk` (used by `Engine.scan_once` when the app sets `engine.news`) fetches Google News RSS (`google_news`).
-  It keeps headlines that name the company (`mentions`), then makes one `gemini_json` call per sector (key in the
-  `x-goog-api-key` header).
+  It keeps headlines that name the company (`mentions`), then makes one `gemini_json_any` call per sector (key in
+  the `x-goog-api-key` header). The model is `auto` by default: `GEMINI_AUTO_MODELS`, best free model first.
 - Results are cached in `APP_DIR/news_DATE.json`.
 - The rows get `news` (the combined score), the optional `news_filter` drops rows at or below `NEG_NEWS`, and
   predictions store `news`.
